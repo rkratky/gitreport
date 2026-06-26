@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "gitreport"
+version = "0.1.0"
+description = "A CLI tool to gather Git activity and generate a Markdown report."
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+click = "^8.1.7"
+pygithub = "^2.3.0"
+launchpadlib = "^1.11.0"
+pyyaml = "^6.0.1"
+pydantic = "^2.7.1"
+dateparser = "^1.2.0"
+keyring = "^25.2.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+black = "^24.4.2"
+ruff = "^0.4.4"
+
+[tool.poetry.scripts]
+gitreport = "gitreport.main:cli"
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

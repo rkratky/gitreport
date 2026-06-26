@@ -1,0 +1,13 @@
+# Example configuration for the gitreport tool.
+#
+# 1. Rename this file to `config.yaml` and place it in `~/.config/gitreport/`.
+# 2. Or, use it with the --config option:
+#    poetry run gitreport generate --config config.example.yaml
+
+providers:
+  github:
+    username: "your-github-username"
+    token: "your-github-personal-access-token" # Needs repo and user scopes for private repos
+  launchpad:
+    username: "your-launchpad-id"
+    token: "" # Not currently used, can be left blank
