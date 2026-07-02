@@ -112,5 +112,3 @@ venv.bak/
 # Pyflow
 pyflow.lock
 
-# Poetry
-poetry.lock

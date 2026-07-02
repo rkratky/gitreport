@@ -33,7 +33,7 @@ on PEP 8, type hints, and modern Python practices.
 ### Testing: PyTest
 
 **Testing Guidelines:**
-- Tests are in `src/docshub/tests/`
+- Tests are in `tests/`
 - Write comprehensive unit tests for all business logic
 - Test behaviors, not implementation
 - Follow the AAA pattern: Arrange, Act, Assert — but do **not** annotate sections

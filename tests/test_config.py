@@ -1,8 +1,9 @@
-import pytest
 from pathlib import Path
-import yaml
 
-from src.gitreport.config import load_config, Config
+import pytest
+import yaml
+from gitreport.config import Config, load_config
+
 
 def test_load_config_success(tmp_path: Path):
     """Test that a valid config file is loaded correctly."""
@@ -22,10 +23,12 @@ def test_load_config_success(tmp_path: Path):
     assert config.providers["github"].username == "testuser"
     assert "launchpad" in config.providers
 
+
 def test_load_config_file_not_found():
     """Test that FileNotFoundError is raised for a missing file."""
     with pytest.raises(FileNotFoundError):
         load_config(Path("non_existent_file.yaml"))
+
 
 def test_load_config_empty_file(tmp_path: Path):
     """Test that ValueError is raised for an empty file."""
@@ -34,6 +37,7 @@ def test_load_config_empty_file(tmp_path: Path):
     with pytest.raises(ValueError, match="Configuration file is empty."):
         load_config(config_file)
 
+
 def test_load_config_invalid_yaml(tmp_path: Path):
     """Test that ValueError is raised for invalid YAML."""
     config_file = tmp_path / "invalid.yaml"
@@ -41,9 +45,26 @@ def test_load_config_invalid_yaml(tmp_path: Path):
     with pytest.raises(ValueError, match="Error parsing YAML file"):
         load_config(config_file)
 
+
+def test_load_config_token_optional(tmp_path: Path):
+    """A provider may omit the token (e.g. Launchpad uses external auth)."""
+    config_content = {
+        "providers": {
+            "launchpad": {"username": "lp-user"},  # No token.
+        }
+    }
+    config_file = tmp_path / "config.yaml"
+    with open(config_file, "w") as f:
+        yaml.dump(config_content, f)
+
+    config = load_config(config_file)
+    assert config.providers["launchpad"].username == "lp-user"
+    assert config.providers["launchpad"].token is None
+
+
 def test_load_config_validation_error(tmp_path: Path):
     """Test that ValueError is raised for a schema validation error."""
-    config_content = {"providers": {"github": {"username": "testuser"}}}  # Missing token
+    config_content = {"providers": {"github": {"token": "gh-token"}}}  # Missing username
     config_file = tmp_path / "invalid_schema.yaml"
     with open(config_file, "w") as f:
         yaml.dump(config_content, f)

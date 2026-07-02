@@ -6,9 +6,24 @@ A CLI tool to gather a user's Git activity from configured Git providers (e.g., 
 
 *   Gathers activity from multiple Git providers (GitHub and Launchpad supported).
 *   Generates a Markdown report grouped by provider and repository.
-*   Separates activity into PRs submitted, PRs reviewed, issues created, and issues closed.
+*   Reports PRs/merge proposals submitted, reviewed, and merged (when merged by
+    the user but authored by someone else), plus issues/bugs created and closed.
+*   Empty categories, repositories, and providers are omitted from the report.
 *   Configurable via a YAML file.
 *   Flexible date handling, including natural language.
+
+### Known limitation: Launchpad reviewed merge proposals
+
+The Launchpad web-service API has **no endpoint for "merge proposals I have
+reviewed."** The only person-scoped method, `getRequestedReviews`, is a
+*to-do list* — it returns only MPs where a review is still **pending**
+(not yet cast). Once a review is completed, the MP is removed from the list
+regardless of the `status` parameter.
+
+This means the "Merge Proposals Reviewed" section for Launchpad will typically
+be empty or very incomplete for users who complete their reviews promptly.
+The tool prints a warning to stderr when this happens. This is a fundamental
+Launchpad API limitation, not a bug in this tool.
 
 ## Installation
 
@@ -49,9 +64,7 @@ The tool requires a configuration file to access Git providers.
         token: "your-github-personal-access-token" # Needs repo and user scopes
       launchpad:
         username: "your-launchpad-id"
-        token: "" # Not currently used
-    ```
-
+        # No token needed; Launchpad auth uses saved OAuth credentials (below).
     ```
 
 ### Launchpad Authentication
@@ -106,6 +119,7 @@ poetry run gitreport generate [OPTIONS]
 *   `--config FILE`: Path to a custom configuration file.
 *   `--start-date TEXT`: The start date for the report. Accepts `YYYY-MM-DD` or natural language strings (e.g., `"1 week ago"`, `"last Thursday"`). Defaults to `"1 week ago"`.
 *   `--end-date TEXT`: The end date for the report. Accepts `YYYY-MM-DD` or natural language. Defaults to today.
+*   `--fast`: Skip per-item verification API calls for speed. This is much faster on large date ranges, but is slightly less accurate at the reporting-window boundaries and omits the GitHub "PRs Merged" category (GitHub's search API cannot express "merged by me", so that category requires the per-PR calls that `--fast` skips).
 
 ### Examples
 

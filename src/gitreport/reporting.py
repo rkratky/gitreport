@@ -1,79 +1,92 @@
-from typing import Dict, List
-from .providers.base import RepoActivity
+from .providers.base import ACTIVITY_CATEGORIES, ActivityItem, RepoActivity, has_activity
 
 PROVIDER_LABELS = {
     "github": {
-        "prs_submitted": "PRs Submitted",
-        "prs_reviewed": "PRs Reviewed",
-        "issues_created": "Issues Created",
-        "issues_closed": "Issues Closed",
+        "prs_submitted": "PRs submitted",
+        "prs_reviewed": "PRs reviewed",
+        "prs_merged": "PRs merged",
+        "issues_created": "Issues created",
+        "issues_closed": "Issues closed",
     },
     "launchpad": {
-        "prs_submitted": "Merge Proposals Submitted",
-        "prs_reviewed": "Merge Proposals Reviewed",
-        "issues_created": "Bugs Created",
-        "issues_closed": "Bugs Closed",
+        "prs_submitted": "Merge proposals submitted",
+        "prs_reviewed": "Merge proposals reviewed",
+        "prs_merged": "Merge proposals merged",
+        "issues_created": "Bugs created",
+        "issues_closed": "Bugs closed",
     },
 }
 
-def _add_repo_section(report_lines: List[str], repos: list, labels: dict):
-    """Helper to add a section of repos to the report."""
+PROVIDER_DISPLAY_NAMES = {
+    "github": "GitHub",
+    "launchpad": "Launchpad",
+}
+
+
+def _format_item(item: ActivityItem) -> str:
+    line = f"- [{item['title']}]({item['url']})"
+    if item.get("also_merged"):
+        line += " → merged, too"
+    return line
+
+
+def _add_repo_section(
+    report_lines: list[str],
+    repos: list[tuple[str, RepoActivity]],
+    labels: dict,
+) -> None:
+    """Render a group of repositories, omitting empty categories."""
     for repo_name, activity in sorted(repos, key=lambda item: item[0]):
         report_lines.append(f"\n#### {repo_name}")
-        
-        activity_found = False
-        # The visibility key is for sorting, not reporting
-        for activity_type, items in activity.items():
-            if activity_type == 'visibility' or not items:
+        for category in ACTIVITY_CATEGORIES:
+            items = activity[category]
+            if not items:
                 continue
-            
-            activity_found = True
-            title = labels.get(activity_type, activity_type.replace('_', ' ').title())
-            # Add extra newline for readability
+            title = labels.get(category, category.replace("_", " ").title())
             report_lines.append(f"\n##### {title}")
             for item in items:
-                report_lines.append(f"- [{item['title']}]({item['url']})")
+                report_lines.append(_format_item(item))
 
-        if not activity_found:
-            report_lines.append("\nNo activity in the reporting period.")
 
-def generate_report(provider_data: Dict[str, Dict[str, RepoActivity]]) -> str:
+def generate_report(provider_data: dict[str, dict[str, RepoActivity]]) -> str:
     """
     Generates a Markdown report from the collected activity data.
 
-    Args:
-        provider_data: A dictionary where keys are provider names and values
-                       are dictionaries of repository activity.
-
-    Returns:
-        A Markdown formatted string representing the activity report.
+    Empty categories, repositories with no activity, and providers with no
+    active repositories are omitted entirely.
     """
-    report_lines = ["# Git Activity Report"]
+    report_lines = ["# Git activity report"]
 
     for provider_name, repos in provider_data.items():
-        if not repos:
+        # Keep only repositories that have at least one activity item.
+        active_repos = {
+            name: activity for name, activity in repos.items() if has_activity(activity)
+        }
+        if not active_repos:
             continue
 
-        report_lines.append(f"\n## {provider_name.title()}")
-        
+        display_name = PROVIDER_DISPLAY_NAMES.get(provider_name.lower(), provider_name.title())
+        report_lines.append(f"\n## {display_name}")
+
         labels = PROVIDER_LABELS.get(provider_name.lower(), {})
 
-        public_repos = []
-        private_repos = []
-        for repo_name, activity in repos.items():
-            if activity['visibility'] == 'public':
-                public_repos.append((repo_name, activity))
-            else:
-                private_repos.append((repo_name, activity))
+        public_repos = [
+            (name, activity)
+            for name, activity in active_repos.items()
+            if activity["visibility"] == "public"
+        ]
+        private_repos = [
+            (name, activity)
+            for name, activity in active_repos.items()
+            if activity["visibility"] != "public"
+        ]
 
         if public_repos and private_repos:
-            report_lines.append("\n### Public Repositories")
+            report_lines.append("\n### Public repositories")
             _add_repo_section(report_lines, public_repos, labels)
-            report_lines.append("\n### Private Repositories")
+            report_lines.append("\n### Private repositories")
             _add_repo_section(report_lines, private_repos, labels)
-        elif public_repos:
-            _add_repo_section(report_lines, public_repos, labels)
-        elif private_repos:
-            _add_repo_section(report_lines, private_repos, labels)
+        else:
+            _add_repo_section(report_lines, public_repos or private_repos, labels)
 
     return "\n".join(report_lines)

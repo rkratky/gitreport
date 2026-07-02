@@ -10,4 +10,5 @@ providers:
     token: "your-github-personal-access-token" # Needs repo and user scopes for private repos
   launchpad:
     username: "your-launchpad-id"
-    token: "" # Not currently used, can be left blank
+    # No token needed: Launchpad auth uses saved OAuth credentials created by
+    # `poetry run python auth_launchpad.py`. The token field may be omitted.
