@@ -63,7 +63,7 @@ The tool requires a configuration file to access Git providers.
     providers:
       github:
         username: "your-github-username"
-        token: "your-github-personal-access-token" # Needs repo and user scopes
+        token: "your-github-personal-access-token"  # Classic PAT: repo + user scopes, plus notifications for the attention digest
       launchpad:
         username: "your-launchpad-id"
         # No token needed; Launchpad auth uses saved OAuth credentials (below).
@@ -315,12 +315,13 @@ wall-clock time of that read, used for the status line), and
 
 **Corruption:** writes are atomic (temporary file + rename) and happen under
 an exclusive lock, so corruption is unlikely. If the file is ever unreadable,
-the next state-mutating command (`digest`, `read`, `ack`, `unack`) renames it
+the next state-mutating command (`digest`, `read`) renames it
 to `state.json.corrupt-<timestamp>` and rebuilds an empty state, with a
-warning on stderr; read-only views (`attention`, `ack --list`) treat the
-corrupt file as empty without renaming it or warning. **Ack/read history in
-the renamed file is lost**, though the backup remains on disk for manual
-inspection.
+warning on stderr; read-only views (`attention`, `ack --list`) and item
+commands (`ack <ID>`, `unack`) treat the corrupt file as empty without
+renaming it or warning — item commands will simply report "No open item
+matches". **Ack/read history in the renamed file is lost**, though the backup
+remains on disk for manual inspection.
 
 **Retention:** an `acked` or `resolved` item is pruned 30 days after its
 sources stopped reporting it. While any source still reports an acked item,
