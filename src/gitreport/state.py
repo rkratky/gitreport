@@ -121,17 +121,18 @@ def save_state(path: Path, state: AttentionState) -> None:
 
     A crash at any point must never leave an empty or truncated state.json.
 
-    Note: may raise after a successful rename if the directory fsync fails (data already durable).
+    Note: may raise after a successful rename if the directory fsync fails; state.json
+    is complete, but the rename may not survive a crash.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp.unlink(missing_ok=True)  # a stale tmp (or symlink) must not be followed
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.fchmod(fd, 0o600)  # a stale tmp file may carry an older mode: force 0600
             f = os.fdopen(fd, "w")
         except BaseException:
-            os.close(fd)  # fchmod/fdopen failed, so nothing owns the fd yet
+            os.close(fd)  # fdopen failed, so nothing owns the fd yet
             raise
         with f:
             f.write(json.dumps(state.model_dump(), indent=2))
