@@ -587,7 +587,10 @@ def _recover_last_reviewed(state: AttentionState, digest_stem: Path) -> None:
     if newest_ts is None or not targets:
         return
     meta, body = strip_front_matter(targets[0].read_text())
-    if "Status: Reviewed" in body:
+    # Line-anchored: "Status: Reviewed" is only the digest's own status line.
+    # Item titles/reasons carrying the same text mid-line (e.g. a CI-failure
+    # item whose thread says "Status: Reviewed by bob") must not count.
+    if re.search(r"^Status: Reviewed", body, re.MULTILINE):
         state.last_reviewed = newest_ts
     else:
         state.last_reviewed = meta.get("coverage_start")

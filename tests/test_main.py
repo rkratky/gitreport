@@ -576,6 +576,44 @@ def test_read_recovers_last_reviewed_from_reviewed_digest(mock_load_config, tmp_
 
 
 @patch("gitreport.main.load_config")
+def test_read_recovers_last_reviewed_ignores_mid_line_reviewed_text(mock_load_config, tmp_path):
+    """Final wave 2 BUG-C: the "Status: Reviewed" recovery check is
+    line-anchored — an item title carrying the text "Status: Reviewed by bob"
+    mid-line (with a list-item prefix) must not make the digest count as
+    reviewed; the cursor recovers to coverage_start, so `read` still advances
+    it (record_read runs and stamps the status line). Under the old substring
+    check the recovery wrongly claimed generated_at, the forward-only guard
+    blocked record_read, and reviewed_at stayed None."""
+    tmp = tmp_path
+    stem = tmp / "digests" / "2026-09-28"
+    (tmp / "digests").mkdir()
+    (tmp / "digests" / "2026-09-28.md").write_text(
+        "---\n"
+        "generated_at: 2026-09-28T06:00:00+00:00\n"
+        "coverage_start: 2026-09-20T06:00:00+00:00\n"
+        "---\n\n"
+        "# GitReport digest\n\n"
+        "  - ci_failure T: Status: Reviewed by bob in the PR thread\n\n"
+        "Status: NOT YET REVIEWED — run `gitreport read` after reviewing\n"
+    )
+    (tmp / "state.json").write_text("{corrupt")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json", stem=stem, latest=tmp / "digests" / "latest"
+    )
+
+    result = CliRunner().invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    state = json.loads((tmp / "state.json").read_text())
+    # record_read ran: the recovered cursor was coverage_start, so the newest
+    # digest was still "later" — recovery did not claim this digest reviewed.
+    assert state["reviewed_at"] is not None
+    assert state["last_reviewed"] == "2026-09-28T06:00:00+00:00"
+    digest_text = (tmp / "digests" / "2026-09-28.md").read_text()
+    assert "Status: NOT YET REVIEWED" not in digest_text
+
+
+@patch("gitreport.main.load_config")
 def test_read_does_not_move_cursor_back(mock_load_config, tmp_path):
     """FINAL-06: `read` never moves the cursor backwards; a hand-aged digest
     (generated_at older than the cursor) leaves the cursor untouched."""

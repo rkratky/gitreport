@@ -399,12 +399,13 @@ class LaunchpadProvider:
 
         Self-activity rule: the timestamp is only used when the bug's newest
         message was authored by someone other than the user — walk
-        `bug.messages` to find that author (`date_last_updated` itself cannot
-        be author-gated, so it is kept only as the reported time once the
-        author check passes). When messages are unavailable or the newest
-        message is the user's own, `updated_at` is None: the item stays in
-        the inbox by presence, but no event (refresh/reopen) is derived from
-        it.
+        `bug.messages` to find that author. The timestamp is that foreign
+        message's `date_created`, never `bug.date_last_updated`: the latter
+        also moves on the user's own non-message edits (status changes,
+        assignee changes), which must not refresh or reopen the item. When
+        messages are unavailable or the newest message is the user's own,
+        `updated_at` is None: the item stays in the inbox by presence, but no
+        event (refresh/reopen) is derived from it.
 
         Perf note: walking `bug.messages` costs an extra launchpadlib
         collection round-trip per bug (plus one for `bug.bug` on tasks);
@@ -420,8 +421,7 @@ class LaunchpadProvider:
                 newest, newest_owner = when, getattr(message, "owner", None)
         if newest is None or _same_person(newest_owner, person):
             return None
-        last_updated = getattr(bug, "date_last_updated", None)
-        return (last_updated or newest).isoformat()
+        return newest.isoformat()
 
     def _bug_item(self, bug, person, kind, reason) -> AttentionItem:
         return AttentionItem(

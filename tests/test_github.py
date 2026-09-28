@@ -876,3 +876,44 @@ def test_github_ci_activity_with_state_record_preserved():
     assert fetch["ok"] is True
     assert [i["kind"] for i in fetch["items"]] == ["ci_failure"]
     assert fetch["items"][0]["id"] == "gh:https://api.github.com/notifications/threads/1"
+
+
+# --- Final wave 2 BUG-A: _ci_failed tri-state caller rules ---
+
+
+def test_github_ci_activity_state_record_with_success_checks_skipped():
+    """BUG-A: a ci_activity notification whose check runs all succeed is
+    skipped even when a state record exists — the record must not keep a
+    non-failure item alive."""
+    provider = _provider_with_notifications(
+        [_notification_mock("ci_activity")],
+        check_runs=["success", "success"],
+    )
+    state_items = {"gh:https://github.com/org/repo/pull/1": {"status": "open"}}
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert fetch["ok"] is True
+    assert fetch["items"] == []
+
+
+def test_github_ci_activity_lookup_error_acked_record_not_reemitted():
+    """BUG-A: an unverifiable ci_activity notification is only re-emitted for
+    an open state record — an acked record must not come back to the inbox."""
+    notification = MockNotification(
+        "ci_activity",
+        subject_url="",
+        subject_type="CheckSuite",  # real shape: null subject url
+        thread_url="https://api.github.com/notifications/threads/1",
+    )
+    state_items = {"gh:https://api.github.com/notifications/threads/1": {"status": "acked"}}
+    empty_search = {"data": {"search": {"pageInfo": {"hasNextPage": False}, "nodes": []}}}
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = [notification]
+        instance.get_repo.side_effect = RuntimeError("api down")
+        instance.search_issues.return_value = []
+        instance.requester.graphql_query.return_value = ((), empty_search)
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert fetch["ok"] is True
+    assert fetch["items"] == []

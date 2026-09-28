@@ -329,10 +329,14 @@ def test_lp_bug_self_authored_bump_is_presence_only():
 
 
 def test_lp_bug_foreign_newest_message_keeps_freshness():
-    """FINAL-02: a newest message by someone else author-gates the freshness
-    through: updated_at is the bug's date_last_updated."""
+    """Final wave 2 BUG-B: a newest message by someone else author-gates the
+    freshness through: updated_at is that foreign message's date_created —
+    never bug.date_last_updated, which also moves on the user's own
+    non-message edits (e.g. the user closing the task)."""
     provider = _lp_provider()
     foreign = MockLaunchpadObject(self_link="https://api.launchpad.net/devel/~otheruser")
+    # T2 = date_last_updated (moved by the user's own non-message edit) is
+    # newer than T1 = the newest foreign message; T1 must win.
     bug = _bug_mock(
         "proj",
         date_last_updated=datetime(2026, 9, 27, tzinfo=UTC),
@@ -344,7 +348,25 @@ def test_lp_bug_foreign_newest_message_keeps_freshness():
         assigned=[bug], subscribed=[]
     )
     fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
-    assert fetch["items"][0]["updated_at"] == "2026-09-27T00:00:00+00:00"
+    assert fetch["items"][0]["updated_at"] == "2026-09-26T00:00:00+00:00"
+
+
+def test_lp_bug_no_foreign_message_updated_at_none():
+    """Final wave 2 BUG-B: when no foreign message exists, updated_at is None
+    even though date_last_updated is set — the item stays presence-only."""
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    me.self_link = "https://api.launchpad.net/devel/~testuser"
+    bug = _bug_mock(
+        "proj",
+        date_last_updated=datetime(2026, 9, 27, tzinfo=UTC),
+        messages=[MockLaunchpadObject(owner=me, date_created=datetime(2026, 9, 26, tzinfo=UTC))],
+    )
+    provider._launchpad.bugs.searchTasks.side_effect = _bug_search_side_effect(
+        assigned=[bug], subscribed=[]
+    )
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["items"][0]["updated_at"] is None
 
 
 def test_lp_resolved_ids_proven_closed():

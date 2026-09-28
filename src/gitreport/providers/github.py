@@ -255,16 +255,22 @@ class GitHubProvider:
             item_id = f"gh:{id_url or thread_url}"
             reason = n.reason
             if reason == "ci_activity":
-                # An unverifiable ci_activity notification must not fabricate a
-                # new item. But when a state record with this id already exists
-                # (e.g. a previously verified failure whose check-run lookup
-                # now fails), re-emit it: the fetch then still reports the
-                # item, so no absence-based resolution fires on unverified
-                # data and the existing record (and its freshness) is kept.
-                if item_id not in (state_items or {}) and not self._ci_failed(
-                    full_name, subject_url
-                ):
+                # Tri-state check: True = a check run failed (emit); False =
+                # checked, no failure (skip); None = lookup error or
+                # unverifiable shape. On None, re-emit ONLY when a state
+                # record for this id already exists and is still open (e.g. a
+                # previously verified failure whose check-run lookup now
+                # fails): the fetch then still reports the item, so no
+                # absence-based resolution fires on unverified data. Acked
+                # records stay out of the inbox, and unverified data never
+                # fabricates a new failure item.
+                ci_state = self._ci_failed(full_name, subject_url)
+                if ci_state is False:
                     continue
+                if ci_state is None:
+                    record = (state_items or {}).get(item_id)
+                    if record is None or record.get("status") != "open":
+                        continue
                 kind = "ci_failure"
             else:
                 kind = GH_REASON_KIND.get(reason)
@@ -289,15 +295,18 @@ class GitHubProvider:
             )
         return items
 
-    def _ci_failed(self, full_name: str, subject_url: str) -> bool:
-        """True when the subject's check runs contain a failure.
+    def _ci_failed(self, full_name: str, subject_url: str) -> bool | None:
+        """Tri-state check-run verification for a ci_activity notification.
 
-        v1 limitation: GitHub sends ci_activity notifications with a
-        CheckSuite subject and null url; those are skipped here — failing
-        checks on the user's own PRs are still caught by the status:failure
-        search query. The caller re-emits a notification whose id already has
-        a state record even when this cannot verify, so no absence-based
-        resolution fires on unverified data.
+        True when the subject's check runs contain a failure; False when the
+        lookup succeeds and none fail; None when the lookup errors or the
+        shape is unverifiable (null subject url). v1 limitation: GitHub sends
+        ci_activity notifications with a CheckSuite subject and null url;
+        those return None here — failing checks on the user's own PRs are
+        still caught by the status:failure search query. The caller re-emits
+        a notification whose id already has an open state record even when
+        this cannot verify, so no absence-based resolution fires on
+        unverified data.
         """
         try:
             number = int(subject_url.rsplit("/", 1)[1])
@@ -308,7 +317,7 @@ class GitHubProvider:
             checks = repo.get_commit(pr.head.sha).get_check_runs()
             return any(c.conclusion == "failure" for c in checks)
         except Exception:
-            return False  # cannot verify -> skip, never fabricate a failure
+            return None  # cannot verify -> never fabricate or skip a failure
 
     def _search_item(self, issue, kind: str, reason: str, exclusions) -> AttentionItem | None:
         """A query-origin item for a search match.
