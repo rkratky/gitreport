@@ -369,6 +369,42 @@ def test_github_release_subject_shows_repo_html_url():
     assert fetch["items"][0]["thread_url"] == "https://api.github.com/notifications/threads/1"
 
 
+def test_github_release_notifications_have_distinct_ids():
+    """Two non-rewritable-subject notifications (e.g. releases) in the same
+    repo must not collapse into one dedupe id: identity comes from the
+    per-notification thread url, display from the repository page."""
+    notifications = [
+        MockNotification(
+            "comment",
+            repo="org/repo",
+            title="v1.0",
+            subject_url="https://api.github.com/repos/org/repo/releases/99",
+            thread_url="https://api.github.com/notifications/threads/101",
+            subject_type="Release",
+        ),
+        MockNotification(
+            "mention",
+            repo="org/repo",
+            title="v2.0",
+            subject_url="https://api.github.com/repos/org/repo/releases/100",
+            thread_url="https://api.github.com/notifications/threads/102",
+            subject_type="Release",
+        ),
+    ]
+    provider = _provider_with_notifications(notifications)
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    # Distinct thread urls -> distinct ids (dedupe must not fold them).
+    assert [i["id"] for i in fetch["items"]] == [
+        "gh:https://api.github.com/notifications/threads/101",
+        "gh:https://api.github.com/notifications/threads/102",
+    ]
+    # Display stays the shared repository page for both.
+    assert [i["url"] for i in fetch["items"]] == [
+        "https://github.com/org/repo",
+        "https://github.com/org/repo",
+    ]
+
+
 def test_github_notification_repo_from_subject_url_when_repository_none():
     """Without a repository object the repo is parsed from the subject url."""
     notification = MockNotification(
@@ -550,6 +586,40 @@ def test_github_null_review_threads_does_not_crash():
                             "title": "Null threads",
                             "updatedAt": "2026-09-27T10:00:00Z",
                             "reviewThreads": None,
+                        }
+                    ],
+                }
+            }
+        }
+        instance.requester.graphql_query.return_value = (payload, ())
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+
+    assert fetch["ok"] is True
+    assert fetch["items"] == []
+
+
+def test_github_null_nodes_in_review_threads_does_not_crash():
+    """reviewThreads.nodes explicitly null (key present, value None):
+    no crash, no items."""
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = []
+        instance.search_issues.return_value = []
+        payload = {
+            "data": {
+                "search": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "url": "https://github.com/o/r/pull/8",
+                            "title": "Null nodes",
+                            "updatedAt": "2026-09-27T10:00:00Z",
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": None,
+                            },
                         }
                     ],
                 }

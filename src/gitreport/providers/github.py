@@ -225,6 +225,7 @@ class GitHubProvider:
                     .replace("/pulls/", "/pull/")
                     .replace("/commits/", "/commit/")
                 )
+                id_url = html_url
             else:
                 # Other subject types (releases, discussions, ...) have no
                 # predictable api->html rewrite; display the repository page
@@ -232,11 +233,16 @@ class GitHubProvider:
                 html_url = getattr(repository, "html_url", None) or (
                     f"https://github.com/{full_name}" if full_name else ""
                 )
+                # Identity and display diverge here: every notification of
+                # this kind in a repo displays the same repo page url, so the
+                # id must come from the unique per-notification thread api
+                # url — otherwise dedupe folds distinct releases into one.
+                id_url = thread_url
             items.append(
                 self._item(
                     # Ids use the html url form so query/GraphQL-origin items
                     # for the same PR dedupe against notification items.
-                    mid=f"gh:{html_url or thread_url}",
+                    mid=f"gh:{id_url or thread_url}",
                     provider="github",
                     kind=kind,
                     origin="notification",
