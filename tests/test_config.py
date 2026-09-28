@@ -71,3 +71,49 @@ def test_load_config_validation_error(tmp_path: Path):
 
     with pytest.raises(ValueError, match="Configuration validation error"):
         load_config(config_file)
+
+
+def test_attention_block_optional_with_defaults(tmp_path: Path):
+    """An existing config without `attention:` validates and gets defaults."""
+    config_content = {"providers": {"github": {"username": "u", "token": "t"}}}
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+    assert config.attention.stale_pr_days == 7
+    assert config.attention.digest_formats == ["html", "md"]
+    assert config.attention.exclusions == {}
+    assert str(config.attention.state_path).endswith("state.json")
+
+
+def test_attention_custom_values(tmp_path: Path):
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "exclusions": {"github": ["me/fork-*"]},
+            "stale_pr_days": 3,
+            "state_path": "~/tmp/state.json",
+            "digest_formats": ["html", "md"],
+            "digest_output": "~/tmp/digests/YYYY-MM-DD",
+            "digest_latest": "~/tmp/digests/latest",
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+    assert config.attention.stale_pr_days == 3
+    assert config.attention.exclusions == {"github": ["me/fork-*"]}
+    assert not str(config.attention.state_path).startswith("~")
+
+
+def test_attention_md_format_required(tmp_path: Path):
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {"digest_formats": ["html"]},
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    with pytest.raises(ValueError, match="requires the .md. digest format"):
+        load_config(config_file)
