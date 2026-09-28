@@ -8,13 +8,18 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 RETENTION_DAYS = 30
 
 
 class ItemState(BaseModel):
     """State of one attention item, keyed by its stable id."""
+
+    # R7: unknown fields survive the round trip. A newer release may write
+    # fields this one does not know; silently dropping them on the next save
+    # destroys that release's data.
+    model_config = ConfigDict(extra="allow")
 
     status: str = "open"  # open | acked | resolved
     origins: list[str] = Field(default_factory=list)
@@ -38,6 +43,9 @@ class ItemState(BaseModel):
 
 
 class AttentionState(BaseModel):
+    # R7: see ItemState — unknown top-level fields survive the round trip.
+    model_config = ConfigDict(extra="allow")
+
     version: int = 1
     last_digest_run: str | None = None
     last_reviewed: str | None = None
@@ -105,6 +113,21 @@ def _parse_state(path: Path) -> tuple[AttentionState | None, Exception | None]:
         return AttentionState.model_validate(data), None
     except (json.JSONDecodeError, ValueError) as e:
         return None, e
+
+
+def is_state_loadable(path: Path) -> bool:
+    """Parse-check the state file with no side effects (no rename, no warning).
+
+    True when the file is absent (nothing to be corrupt) or parses cleanly;
+    False when it exists but is unloadable. `digest` uses this before the
+    lock to decide whether the pre-lock snapshot can be trusted for the
+    coverage window (R2); the under-lock load keeps its own backup+rebuild
+    policy.
+    """
+    if not path.exists():
+        return True
+    state, _err = _parse_state(path)
+    return state is not None
 
 
 def _warn_on_version(state: AttentionState, path: Path) -> None:

@@ -23,6 +23,7 @@ from .providers.launchpad import LaunchpadProvider
 from .reporting import generate_report
 from .state import (
     AttentionState,
+    is_state_loadable,
     load_state,
     load_state_snapshot,
     load_state_with_rebuild_flag,
@@ -278,7 +279,18 @@ def digest(config_path_str, open_browser):
     # Snapshot for fetches (outside the lock; non-mutating read).
     pre_state = load_state_snapshot(att.state_path)
     generated_at = datetime.now(UTC).isoformat()
-    since = _attention_since(pre_state)
+    if is_state_loadable(att.state_path):
+        since = _attention_since(pre_state)
+    else:
+        # R2: the snapshot of a corrupt state is empty, so the 24h first-run
+        # fallback would collapse coverage. The digest files still record the
+        # cursor — recover it read-only BEFORE the window is fixed. The
+        # under-lock rebuild+recovery below stays authoritative for the
+        # saved state.
+        recovered = _recover_last_reviewed_candidate(att.digest_output)
+        since = _parse(recovered) if recovered else None
+        if since is None:
+            since = _attention_since(pre_state)
     state_items = {mid: rec.model_dump() for mid, rec in pre_state.items.items()}
     results, stale = _fetch_attention(
         providers, since, att.exclusions, state_items, att.stale_pr_days
@@ -303,6 +315,9 @@ def digest(config_path_str, open_browser):
 
         # Digest files + symlinks (inside the lock), rendered from the PRUNED
         # state so the saved and rendered views cannot diverge.
+        # R6: a provider can be stale in both fetch lists (e.g. a constructor
+        # failure); dedupe so the warning names each provider once.
+        stale = sorted(set(stale) | set(activity_stale))
         activity_md = generate_report(activity_data)
         coverage_start = since.isoformat()
         md_text = render_digest_markdown(
@@ -310,7 +325,7 @@ def digest(config_path_str, open_browser):
             activity_md,
             coverage_start,
             generated_at,
-            stale + activity_stale,
+            stale,
         )
         stem = Path(
             str(att.digest_output).replace(
@@ -345,6 +360,13 @@ def read(config_path_str, open_browser):
         if rebuilt:
             _recover_last_reviewed(state, att.digest_output)
         previous = state.last_reviewed
+        # R8: an unparseable cursor counts as never-reviewed (build_report's
+        # convention) — a garbage cursor must not wedge `read` (no targets,
+        # no restamp, cursor never moves).
+        previous_dt = _parse(previous) if previous else None
+        if previous and previous_dt is None:
+            previous = None
+            previous_dt = None
         newest_ts, targets = _digests_generated_after(att.digest_output, previous)
         if newest_ts is None:
             click.echo("No digests to mark read.")
@@ -353,7 +375,7 @@ def read(config_path_str, open_browser):
         # as) the cursor — e.g. a recovered cursor, or digests re-generated
         # with an old date — must not drag last_reviewed backwards and re-cover
         # already-consumed events. Unparseable timestamps are never "later".
-        newest_dt, previous_dt = _parse(newest_ts), _parse(previous)
+        newest_dt = _parse(newest_ts)
         later = previous is None or (
             newest_dt is not None and previous_dt is not None and newest_dt > previous_dt
         )
@@ -462,7 +484,10 @@ def unack(item_id, config_path_str):
             if rec is None or rec.status not in ("acked", "resolved"):
                 click.echo(f"Skipping {mid}: no longer acked/resolved.", err=True)
                 continue
-            was_resolved = rec.status == "resolved"
+            # R3: check BEFORE clearing — an acked record whose source
+            # already stamped resolved_at must pin too, or the next digest
+            # (source absent, provider ok) silently re-resolves the unack.
+            was_resolved = rec.status == "resolved" or rec.resolved_at is not None
             rec.status = "open"
             rec.acked = False
             rec.acked_at = None
@@ -488,7 +513,9 @@ def _attention_since(state: AttentionState) -> datetime:
 
 def _open_in_browser(path: Path) -> None:
     if path.exists():
-        webbrowser.open(f"file://{path}")
+        # R9a: as_uri() percent-encodes (spaces, etc.) instead of splicing a
+        # raw path after file:// — and resolve() anchors a CWD-relative path.
+        webbrowser.open(path.resolve().as_uri())
 
 
 def _stem_file(stem: Path, ext: str) -> Path:
@@ -583,17 +610,31 @@ def _recover_last_reviewed(state: AttentionState, digest_stem: Path) -> None:
     back to the 24h first-run window. Only called right after `load_state`
     rebuilt from a corrupt file (digest/read, under the state lock).
     """
+    recovered = _recover_last_reviewed_candidate(digest_stem)
+    if recovered is not None:
+        state.last_reviewed = recovered
+
+
+def _recover_last_reviewed_candidate(digest_stem: Path) -> str | None:
+    """Pure digest-scan core of `_recover_last_reviewed`: no state mutation.
+
+    Returns the cursor candidate the newest dated digest records — its
+    `generated_at` when the body's status line says "Status: Reviewed", else
+    its `coverage_start` (generated but never reviewed) — or None when no
+    digest is usable. Reused by `digest` BEFORE the lock (R2): a corrupt
+    state file must not collapse the coverage window to 24h when the digest
+    files still record where the cursor was.
+    """
     newest_ts, targets = _digests_generated_after(digest_stem, None)
     if newest_ts is None or not targets:
-        return
+        return None
     meta, body = strip_front_matter(targets[0].read_text())
     # Line-anchored: "Status: Reviewed" is only the digest's own status line.
     # Item titles/reasons carrying the same text mid-line (e.g. a CI-failure
     # item whose thread says "Status: Reviewed by bob") must not count.
     if re.search(r"^Status: Reviewed", body, re.MULTILINE):
-        state.last_reviewed = newest_ts
-    else:
-        state.last_reviewed = meta.get("coverage_start")
+        return newest_ts
+    return meta.get("coverage_start")
 
 
 def _digests_generated_after(pattern: Path, previous: str | None) -> tuple[str | None, list[Path]]:

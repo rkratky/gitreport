@@ -413,6 +413,59 @@ def test_re_report_resets_resolved_at():
     assert new_state["items"]["gh:1"]["reopen_count"] == 0  # not a new event
 
 
+def test_resolved_rereported_with_new_event_counts_reopen():
+    """R1: a resolved record re-reported with a genuinely new event is a
+    reopen — the spec's reopen rule covers acked OR resolved records, so the
+    bump must be reachable for just-resolved records too."""
+    state = state_with(
+        items={
+            "gh:1": rec(
+                status="resolved",
+                resolved_at="2026-09-01T00:00:00+00:00",
+                first_seen="2026-09-01T06:00:00+00:00",
+                last_updated="2026-09-01T06:00:00+00:00",
+            )
+        }
+    )
+    new_state = merge_into_state(
+        state, merged_with(item(mid="gh:1", updated_at=LATER)), {"github"}, LATER
+    )
+    r = new_state["items"]["gh:1"]
+    assert r["status"] == "open"
+    assert r["reopen_count"] == 1
+    assert r["first_seen"] == "2026-09-01T06:00:00+00:00"  # unchanged: not New again
+
+
+def test_reasons_are_replaced_not_appended():
+    """R4: reasons reflect THIS run's fetch — 10 stale reasons plus a fresh
+    one must not cap the fresh reason out of the list."""
+    state = state_with(items={"gh:1": rec(reasons=[f"stale {i}" for i in range(10)])})
+    new_state = merge_into_state(
+        state,
+        merged_with(item(mid="gh:1", updated_at=LATER, reason="check failure")),
+        {"github"},
+        LATER,
+    )
+    assert new_state["items"]["gh:1"]["reasons"] == ["check failure"]
+
+
+def test_reasons_stale_count_dropped_on_later_fetch():
+    """R4: a stale count from an earlier run must not persist once the
+    current run reports a different value."""
+    state = state_with(items={"gh:1": rec(reasons=["3 unresolved comments"])})
+    carried = merge_into_state(
+        state, merged_with(item(mid="gh:1", reason="3 unresolved comments")), {"github"}, NOW
+    )
+    assert carried["items"]["gh:1"]["reasons"] == ["3 unresolved comments"]
+    later = merge_into_state(
+        carried,
+        merged_with(item(mid="gh:1", updated_at=LATER, reason="1 unresolved comment")),
+        {"github"},
+        LATER,
+    )
+    assert later["items"]["gh:1"]["reasons"] == ["1 unresolved comment"]
+
+
 def test_acked_self_activity_bump_stays_acked():
     """FINAL-02: a same-run re-report with updated_at=None (the provider
     suppressed a self-authored bump) carries no new event: an acked record

@@ -509,6 +509,140 @@ def test_load_failure_not_proof_for_acked():
     assert fetch["resolved_ids"] == []
 
 
+def test_proven_resolved_user_voted_after_last_updated():
+    """R5 leave rule: the user's own vote-comment after the record's
+    last_updated proves the user responded — the open item leaves the inbox."""
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    me.self_link = "https://api.launchpad.net/devel/~testuser"
+    mp = _mp(
+        "https://launchpad.net/~u/+git/repo/+merge/11",
+        votes=[
+            MockVote(
+                reviewer=me,
+                registrant=me,
+                comment=MockComment(datetime(2026, 9, 29, tzinfo=UTC)),
+            )
+        ],
+    )
+    provider._launchpad.load.return_value = mp
+    state_items = {
+        "lp:https://launchpad.net/~u/+git/repo/+merge/11": {
+            "url": "https://launchpad.net/~u/+git/repo/+merge/11",
+            "provider": "launchpad",
+            "status": "open",
+            "last_updated": "2026-09-28T00:00:00+00:00",
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert "lp:https://launchpad.net/~u/+git/repo/+merge/11" in fetch["resolved_ids"]
+
+
+def test_proven_resolved_user_comment_after_naive_last_updated():
+    """R5 leave rule (naive-safe): a naive stored last_updated is read as
+    UTC, so a later all_comments entry by the user still proves the leave."""
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    me.self_link = "https://api.launchpad.net/devel/~testuser"
+    mp = _mp(
+        "https://launchpad.net/~u/+git/repo/+merge/12",
+        votes=[],
+        all_comments=[
+            MockLaunchpadObject(author=me, date_created=datetime(2026, 9, 28, 12, 0, tzinfo=UTC))
+        ],
+    )
+    provider._launchpad.load.return_value = mp
+    state_items = {
+        "lp:https://launchpad.net/~u/+git/repo/+merge/12": {
+            "url": "https://launchpad.net/~u/+git/repo/+merge/12",
+            "provider": "launchpad",
+            "status": "open",
+            "last_updated": "2026-09-26T00:00:00",  # naive: read as UTC
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert "lp:https://launchpad.net/~u/+git/repo/+merge/12" in fetch["resolved_ids"]
+
+
+def test_proven_resolved_user_bug_message_after_last_updated():
+    """R5 leave rule on bugs: the user's own message after the record's
+    last_updated proves the user responded (naive stored ts read as UTC)."""
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    me.self_link = "https://api.launchpad.net/devel/~testuser"
+    bug = _bug_mock(
+        "proj",
+        status="New",
+        messages=[MockLaunchpadObject(owner=me, date_created=datetime(2026, 9, 28, 12, 0))],
+    )
+    provider._launchpad.load.return_value = bug
+    state_items = {
+        "lp:https://launchpad.net/bugs/77": {
+            "url": "https://launchpad.net/bugs/77",
+            "provider": "launchpad",
+            "status": "open",
+            "last_updated": "2026-09-26T00:00:00",  # naive stored ts
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert "lp:https://launchpad.net/bugs/77" in fetch["resolved_ids"]
+
+
+def test_proven_resolved_heuristic_exception_is_skipped():
+    """R5: a probe failure inside the leave heuristic is skipped — never
+    treated as proof of leaving, never a crash of the fetch."""
+
+    class BoomIterable:
+        def __iter__(self):
+            raise RuntimeError("collection boom")
+
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    me.self_link = "https://api.launchpad.net/devel/~testuser"
+    mp = _mp("https://launchpad.net/~u/+git/repo/+merge/13", votes=BoomIterable())
+    provider._launchpad.load.return_value = mp
+    state_items = {
+        "lp:https://launchpad.net/~u/+git/repo/+merge/13": {
+            "url": "https://launchpad.net/~u/+git/repo/+merge/13",
+            "provider": "launchpad",
+            "status": "open",
+            "last_updated": "2026-09-26T00:00:00+00:00",
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert fetch["ok"] is True
+    assert fetch["resolved_ids"] == []
+
+
+def test_proven_resolved_leave_rule_not_applied_to_acked():
+    """R5 scoping: the leave heuristic only applies to open records; an
+    acked record stays acked unless its live status is proven closed."""
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    me.self_link = "https://api.launchpad.net/devel/~testuser"
+    mp = _mp(
+        "https://launchpad.net/~u/+git/repo/+merge/14",
+        votes=[
+            MockVote(
+                reviewer=me,
+                registrant=me,
+                comment=MockComment(datetime(2026, 9, 29, tzinfo=UTC)),
+            )
+        ],
+    )
+    provider._launchpad.load.return_value = mp
+    state_items = {
+        "lp:https://launchpad.net/~u/+git/repo/+merge/14": {
+            "url": "https://launchpad.net/~u/+git/repo/+merge/14",
+            "provider": "launchpad",
+            "status": "acked",
+            "last_updated": "2026-09-28T00:00:00+00:00",
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert fetch["resolved_ids"] == []
+
+
 def test_naive_since_gets_utc():
     """BUG-05: a naive `since` is treated as UTC, not a TypeError."""
     provider = _lp_provider()

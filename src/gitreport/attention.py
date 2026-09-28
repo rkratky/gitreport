@@ -137,18 +137,24 @@ def merge_into_state(
         new_event = _is_later(m["updated_at"], r.get("last_updated"))
         for key in ("origins", "kinds"):
             r[key] = sorted(set(r[key]) | set(m[key]))
-        for reason in m["reasons"]:
-            if reason not in r["reasons"]:
-                r["reasons"].append(reason)
-        r["reasons"] = r["reasons"][:MAX_REASONS]
+        # R4: reasons reflect THIS run's fetch — replace, never grow. Stale
+        # values from earlier runs (and the append-then-cap failure mode that
+        # dropped fresh reasons once 10 accumulated) must not persist once
+        # the source reports differently.
+        r["reasons"] = list(m["reasons"])[:MAX_REASONS]
+        # The reopen rule covers records that left the inbox as acked OR
+        # auto-resolved: capture BEFORE the resolution flip below, or the
+        # just-resolved case would be unreachable in the new-event branch.
+        was_resolved = r.get("status") == "resolved"
+        was_acked = r.get("status") == "acked"
         r["resolved_at"] = None  # a source reports it again
         if m.get("thread_url"):
             r["thread_url"] = m["thread_url"]
         # An auto-resolved record whose source reports it again is simply
-        # open again: the suppression ended. This is not a new event, so
-        # reopen_count is not bumped (it never left as "re-opened" work).
-        # Acked records keep the new-event-only reopen rule below.
-        if r["status"] == "resolved":
+        # open again: the suppression ended. With a genuinely new event it
+        # is also re-opened work (reopen bump below); without one it is a
+        # silent re-show, not a reopen.
+        if was_resolved:
             r["status"] = "open"
         if new_event:
             r["repo"], r["title"], r["url"] = m["repo"], m["title"], m["url"]
@@ -157,7 +163,7 @@ def merge_into_state(
             r["last_updated"] = m["updated_at"]
             if r.get("pinned"):
                 pass  # pinned: refresh display only; stays open
-            elif r["status"] == "acked":
+            elif was_acked or was_resolved:
                 r.update(
                     status="open",
                     acked=False,

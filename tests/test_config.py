@@ -108,6 +108,28 @@ def test_attention_custom_values(tmp_path: Path):
     assert not str(config.attention.state_path).startswith("~")
 
 
+def test_relative_attention_paths_resolve_against_config_dir(tmp_path: Path):
+    """R9b: a still-relative attention path resolves against the config
+    file's parent (after expanduser), not the process CWD."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": "state/state.json",
+            "digest_output": "digests/YYYY-MM-DD",
+            "digest_latest": "digests/latest",
+        },
+    }
+    config_file = tmp_path / "sub" / "config.yaml"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+
+    assert config.attention.state_path == tmp_path / "sub" / "state" / "state.json"
+    assert config.attention.digest_output == tmp_path / "sub" / "digests" / "YYYY-MM-DD"
+    assert config.attention.digest_latest == tmp_path / "sub" / "digests" / "latest"
+
+
 def test_attention_md_format_required(tmp_path: Path):
     config_content = {
         "providers": {"github": {"username": "u", "token": "t"}},

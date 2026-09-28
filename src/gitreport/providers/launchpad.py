@@ -71,6 +71,28 @@ def _in_range(when: datetime | None, start: datetime, end: datetime) -> bool:
     return when is not None and start <= when <= end
 
 
+def _parse_naive_utc(ts: str | None) -> datetime | None:
+    """ISO timestamp string -> aware datetime; naive values are read as UTC.
+
+    None and unparseable input return None rather than raising: one malformed
+    stored field must never abort the resolved-id pass.
+    """
+    if ts is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+def _aware_utc(dt: datetime | None) -> datetime | None:
+    """Naive launchpadlib datetimes are read as UTC; aware ones pass through."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt
+
+
 def _api_url(web_url: str) -> str:
     """
     Map a Launchpad web URL to its API URL.
@@ -463,8 +485,16 @@ class LaunchpadProvider:
         return latest
 
     def _proven_resolved(self, state_items: dict[str, dict] | None) -> list[str]:
-        """Re-load open or acked LP items from state; report ids proven closed."""
+        """Re-load open or acked LP items from state; report ids proven closed.
+
+        Two proof paths (R5): a closing status on the live object, and — for
+        open records only — the leave rule: the user commented/voted on the
+        item after its recorded last_updated, so it no longer needs
+        attention (spec: "user commented/voted after last_updated"). Every
+        probe failure is skipped, never treated as proof.
+        """
         resolved: list[str] = []
+        person = self._launchpad.me
         for mid, rec in (state_items or {}).items():
             if not mid.startswith("lp:") or rec.get("status") not in ("open", "acked"):
                 continue
@@ -475,4 +505,49 @@ class LaunchpadProvider:
             status = getattr(obj, "status", None) or getattr(obj, "queue_status", None)
             if status in CLOSED_BUG_STATUSES or status in self.MP_CLOSED_STATUSES:
                 resolved.append(mid)
+                continue
+            if rec.get("status") != "open":
+                continue  # the leave rule applies to open records only
+            try:
+                if self._user_responded_after(obj, rec, person):
+                    resolved.append(mid)
+            except Exception:  # noqa: BLE001
+                continue  # heuristic failure is not proof
         return resolved
+
+    def _user_responded_after(self, obj, rec: dict, person) -> bool:
+        """Leave rule: did the user's own activity postdate last_updated?
+
+        Merge proposals: the user's vote-comment dates and `all_comments`
+        entries authored by the user. Bugs: the user's own messages (the
+        object may be a bug task; `_bug_messages` walks to the underlying
+        bug). Naive timestamps on either side are read as UTC.
+        """
+        last_updated = _parse_naive_utc(rec.get("last_updated"))
+        if last_updated is None:
+            return False
+        responded: datetime | None = None
+
+        def consider(when: datetime | None) -> None:
+            nonlocal responded
+            when = _aware_utc(when)
+            if when is not None and (responded is None or when > responded):
+                responded = when
+
+        if getattr(obj, "votes", None) is not None:  # merge proposal
+            for vote in obj.votes:
+                if getattr(vote, "is_pending", False):
+                    continue  # requested but not cast: not user activity
+                if _same_person(vote.reviewer, person):
+                    comment = getattr(vote, "comment", None)
+                    if comment is not None:
+                        consider(getattr(comment, "date_created", None))
+            for comment in getattr(obj, "all_comments", []) or []:
+                if _same_person(getattr(comment, "author", None), person):
+                    consider(getattr(comment, "date_created", None))
+        messages = self._bug_messages(obj)
+        if messages is not None:  # bug (or bug task)
+            for message in messages:
+                if _same_person(getattr(message, "owner", None), person):
+                    consider(getattr(message, "date_created", None))
+        return responded is not None and responded > last_updated

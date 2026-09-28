@@ -84,7 +84,13 @@ def load_config(config_path: Path | None = None) -> Config:
         config = Config.model_validate(config_data)
     except ValidationError as e:
         raise ValueError(f"Configuration validation error: {e}")
-    config.attention.state_path = config.attention.state_path.expanduser()
-    config.attention.digest_output = config.attention.digest_output.expanduser()
-    config.attention.digest_latest = config.attention.digest_latest.expanduser()
+    # R9b: a still-relative attention path is anchored at the config file's
+    # parent (expanduser first, so ~-paths stay absolute and win), never at
+    # whatever CWD the command happened to run from.
+    base = path.parent
+    for field in ("state_path", "digest_output", "digest_latest"):
+        value: Path = getattr(config.attention, field).expanduser()
+        if not value.is_absolute():
+            value = base / value
+        setattr(config.attention, field, value)
     return config

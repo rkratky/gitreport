@@ -145,6 +145,40 @@ def test_corrupt_backup_collision_same_second(tmp_path: Path, monkeypatch):
     assert len(list(tmp_path.glob("state.json.corrupt-*"))) == 2
 
 
+def test_is_state_loadable_parse_check_only(tmp_path: Path):
+    """R2 helper: True for missing/valid, False for corrupt; never mutates."""
+    from gitreport.state import is_state_loadable
+
+    path = tmp_path / "state.json"
+    assert is_state_loadable(path) is True  # missing: nothing to be corrupt
+    path.write_text("{not json")
+    assert is_state_loadable(path) is False
+    assert path.read_text() == "{not json"  # no backup/rename side effect
+    path.write_text(json.dumps({"version": 1, "items": {}}))
+    assert is_state_loadable(path) is True
+
+
+def test_unknown_fields_roundtrip_v2_file(tmp_path: Path):
+    """R7: unknown top-level and per-item fields (a v2-style file) survive
+    load→save→reload instead of being dropped on the next save."""
+    path = tmp_path / "state.json"
+    payload = {
+        "version": 2,
+        "future_cursor": "abc",
+        "items": {"gh:1": {"status": "open", "future_flag": True}},
+    }
+    path.write_text(json.dumps(payload))
+
+    state = load_state(path)
+    save_state(path, state)
+    reloaded = load_state(path)
+
+    saved = json.loads(path.read_text())
+    assert saved["future_cursor"] == "abc"
+    assert saved["items"]["gh:1"]["future_flag"] is True
+    assert reloaded.items["gh:1"].model_extra["future_flag"] is True
+
+
 def test_record_read_sets_cursor_fields():
     state = AttentionState()
     record_read(state, "2026-09-28T06:00:00+00:00", "2026-09-28T09:14:00+00:00")

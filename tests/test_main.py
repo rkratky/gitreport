@@ -382,6 +382,41 @@ def test_ack_marks_github_notification_thread_read(mock_load_config, tmp_path):
 
 
 @patch("gitreport.main.load_config")
+def test_unack_acked_with_resolved_at_pins_against_reresolve(mock_load_config, tmp_path):
+    """R3: an acked record can carry resolved_at (its source stopped
+    reporting while it was acked). Unacking it must pin, or the next digest
+    silently re-resolves the unack."""
+    from gitreport.attention import merge_into_state
+    from gitreport.state import save_state
+
+    item_id = "mock:https://github.com/o/r/pull/5"
+    state = AttentionState()
+    state.items[item_id] = _seed_item(
+        item_id,
+        status="acked",
+        acked=True,
+        acked_at="2026-09-28T06:30:00+00:00",
+        resolved_at="2026-09-28T07:00:00+00:00",
+        provider="mock",
+    )
+    save_state(tmp_path / "state.json", state)
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=tmp_path / "digests" / "2026-09-28",
+        latest=tmp_path / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["unack", "o/r/pull/5"])
+
+    assert result.exit_code == 0, result.output
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["items"][item_id]["pinned"] is True
+    # The next digest (item absent, provider ok) must not re-resolve it.
+    merged = merge_into_state(saved, {}, {"mock"}, "2026-09-29T06:00:00+00:00")
+    assert merged["items"][item_id]["status"] == "open"
+
+
+@patch("gitreport.main.load_config")
 def test_unack_resolved_item_pins(mock_load_config, tmp_path):
     from gitreport.state import ItemState, save_state
 
@@ -542,6 +577,42 @@ def test_digest_recovers_last_reviewed_from_unreviewed_digest(mock_load_config, 
 
 
 @patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_corrupt_state_does_not_collapse_coverage(mock_load_config, tmp_path):
+    """R2: when the state file is corrupt, the pre-lock snapshot is empty —
+    computing `since` from it collapses coverage to 24h. The digest must
+    recover the cursor read-only from the newest Reviewed digest first, so
+    coverage_start is that digest's generated_at, not a 24h window."""
+    tmp = tmp_path
+    stem = tmp / "digests" / "2026-09-28"
+    (tmp / "digests").mkdir()
+    # A 7-day-old digest the user already reviewed: the cursor was its
+    # generated_at (2026-09-21), ~7 days before the new digest.
+    (tmp / "digests" / "2026-09-28.md").write_text(
+        "---\n"
+        "generated_at: 2026-09-21T06:00:00+00:00\n"
+        "coverage_start: 2026-09-14T06:00:00+00:00\n"
+        "---\n\n"
+        "# GitReport digest\n\n"
+        "Status: Reviewed Mon 21 Sep 09:14\n"
+    )
+    (tmp / "state.json").write_text("{corrupt")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json", stem=stem, latest=tmp / "digests" / "latest"
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    text = (tmp / "digests" / "2026-09-28.md").read_text()
+    match = re.search(r"^coverage_start: (.+)$", text, re.MULTILINE)
+    assert match is not None
+    assert match.group(1) == "2026-09-21T06:00:00+00:00"
+    state = json.loads((tmp / "state.json").read_text())
+    assert state["last_reviewed"] == "2026-09-21T06:00:00+00:00"
+
+
+@patch("gitreport.main.load_config")
 def test_read_recovers_last_reviewed_from_reviewed_digest(mock_load_config, tmp_path):
     """FINAL-05: after a corrupt-state rebuild, `read` recovers last_reviewed
     from the newest digest's generated_at when its status line says Reviewed.
@@ -646,6 +717,39 @@ def test_read_does_not_move_cursor_back(mock_load_config, tmp_path):
     saved = json.loads((tmp / "state.json").read_text())
     assert saved["last_reviewed"] == "2026-09-28T12:00:00+00:00"  # unchanged
     assert saved["reviewed_at"] == "2026-09-28T13:00:00+00:00"  # unchanged
+
+
+@patch("gitreport.main.load_config")
+def test_read_survives_unparseable_last_reviewed(mock_load_config, tmp_path):
+    """R8: a garbage last_reviewed must not wedge `read` — it counts as
+    never-reviewed (build_report's convention), so the newest digest is
+    restamped and the cursor moves to its generated_at."""
+    from gitreport.state import save_state
+
+    tmp = tmp_path
+    stem = tmp / "digests" / "2026-09-28"
+    (tmp / "digests").mkdir()
+    (tmp / "digests" / "2026-09-28.md").write_text(
+        "---\n"
+        "generated_at: 2026-09-28T06:00:00+00:00\n"
+        "coverage_start: 2026-09-20T06:00:00+00:00\n"
+        "---\n\n"
+        "# GitReport digest\n\n"
+        "Status: NOT YET REVIEWED — run `gitreport read` after reviewing\n"
+    )
+    save_state(tmp / "state.json", AttentionState(last_reviewed="garbage-cursor"))
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json", stem=stem, latest=tmp / "digests" / "latest"
+    )
+
+    result = CliRunner().invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    saved = json.loads((tmp / "state.json").read_text())
+    assert saved["last_reviewed"] == "2026-09-28T06:00:00+00:00"
+    digest_text = (tmp / "digests" / "2026-09-28.md").read_text()
+    assert "Status: Reviewed" in digest_text
+    assert "NOT YET REVIEWED" not in digest_text
 
 
 @patch("gitreport.main.load_config")
@@ -802,6 +906,33 @@ def test_digest_provider_ctor_failure_degrades(mock_load_config, tmp_path):
 
 
 @patch("gitreport.main.load_config")
+def test_digest_stale_warning_names_provider_once(mock_load_config, tmp_path):
+    """R6: a ctor-failed provider is stale in both fetch lists (attention and
+    activity); the digest warning must mention the name exactly once."""
+
+    class CtorBoomProvider(GitProvider):
+        get_activity = MagicMock()
+        get_attention = MagicMock()
+
+        def __init__(self, username, token):
+            raise RuntimeError("ctor boom")
+
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=tmp_path / "digests" / "2026-09-28",
+        latest=tmp_path / "digests" / "latest",
+    )
+
+    with patch("gitreport.main.PROVIDER_MAP", {"mock": CtorBoomProvider}):
+        result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    stale_lines = [line for line in result.output.splitlines() if "failed to fetch" in line]
+    assert len(stale_lines) == 1
+    assert stale_lines[0].count("mock") == 1
+
+
+@patch("gitreport.main.load_config")
 def test_ack_zero_matches_fails_cleanly(mock_load_config, tmp_path):
     """BUG-06: zero matches exit non-zero via ClickException, not a traceback."""
     mock_load_config.return_value = _config_with(
@@ -889,6 +1020,23 @@ def test_symlink_target_is_absolute_for_relative_config(mock_load_config, tmp_pa
     assert os.path.isabs(target)
     assert link.resolve() == tmp_path / "digests" / "2026-09-28.md"
     assert link.exists()  # symlink resolves to the dated file
+
+
+def test_open_in_browser_builds_proper_file_uri(tmp_path, monkeypatch):
+    """R9a: file URLs must be proper URIs — spaces percent-encoded — not a
+    raw path spliced after the scheme."""
+    opened: list[str] = []
+    monkeypatch.setattr("gitreport.main.webbrowser.open", lambda uri: opened.append(uri) or True)
+    target = tmp_path / "digest dir" / "digest file.html"
+    target.parent.mkdir(parents=True)
+    target.write_text("<html></html>")
+
+    from gitreport.main import _open_in_browser
+
+    _open_in_browser(target)
+
+    assert opened == [target.resolve().as_uri()]
+    assert "%20" in opened[0]
 
 
 @pytest.mark.parametrize(
