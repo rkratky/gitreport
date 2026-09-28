@@ -44,7 +44,12 @@ def now_utc() -> str:
     return datetime.now(UTC).isoformat()
 
 
-class state_lock:
+def _warn(message: str) -> None:
+    """Print a WARNING line to stderr (load/prune degrade instead of crashing)."""
+    print(f"WARNING: {message}", file=sys.stderr)
+
+
+class state_lock:  # noqa: N801 -- lowercase by design: it reads as a context manager
     """Exclusive flock on `<state>.lock` for a whole load-modify-write cycle."""
 
     def __init__(self, path: Path):
@@ -53,8 +58,13 @@ class state_lock:
 
     def __enter__(self) -> "state_lock":
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)  # flock failed: nothing owns the fd yet, do not leak it
+            raise
+        self._fd = fd
         return self
 
     def __exit__(self, *exc) -> None:
@@ -64,30 +74,73 @@ class state_lock:
             self._fd = None
 
 
+def _corrupt_backup_path(path: Path) -> Path:
+    """Unique `<path>.corrupt-<UTC stamp>` path; -1, -2, ... suffix on collision."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    backup = Path(f"{path}.corrupt-{stamp}")
+    seq = 0
+    while backup.exists():
+        seq += 1
+        backup = Path(f"{path}.corrupt-{stamp}-{seq}")
+    return backup
+
+
 def load_state(path: Path) -> AttentionState:
-    """Load the inbox state; missing file -> empty, corrupt -> rebuild."""
+    """Load the inbox state; missing file -> empty, corrupt -> rebuild.
+
+    A file written by another release (version != 1) is loaded as-is with a
+    stderr warning: rebuilding would destroy ack/read history, which is worse
+    than loading data we can still read.
+    """
     if not path.exists():
         return AttentionState()
     try:
         data = json.loads(path.read_text())
-        return AttentionState.model_validate(data)
+        state = AttentionState.model_validate(data)
     except (json.JSONDecodeError, ValueError) as e:
-        backup = Path(f"{path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
-        path.rename(backup)
-        print(
-            f"WARNING: state file {path} was corrupt ({e}); backed up to "
-            f"{backup} and rebuilt empty. Ack/read history is lost.",
-            file=sys.stderr,
+        backup = _corrupt_backup_path(path)
+        os.replace(path, backup)
+        _warn(
+            f"state file {path} was corrupt ({e}); backed up to "
+            f"{backup} and rebuilt empty. Ack/read history is lost."
         )
         return AttentionState()
+    if state.version != 1:
+        _warn(
+            f"state file {path} declares version {state.version}, but this release "
+            "writes version 1; it may have been written by another release. "
+            "Loading it as-is; no data is destroyed."
+        )
+    return state
 
 
 def save_state(path: Path, state: AttentionState) -> None:
-    """Atomically write the state (tmp file + rename)."""
+    """Atomically and durably write the state (tmp 0600 + fsync + rename + dir fsync).
+
+    A crash at any point must never leave an empty or truncated state.json.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state.model_dump(), indent=2))
-    os.replace(tmp, path)
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            f = os.fdopen(fd, "w")
+        except BaseException:
+            os.close(fd)  # fdopen failed, so nothing owns the fd yet
+            raise
+        with f:
+            f.write(json.dumps(state.model_dump(), indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # never leave a .json.tmp behind
+        raise
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)  # persist the rename itself across crashes
+    finally:
+        os.close(dir_fd)
 
 
 def record_read(state: AttentionState, generation_ts: str, reviewed_at: str) -> None:
@@ -107,12 +160,21 @@ def prune(state: AttentionState, now: datetime, retention_days: int = RETENTION_
     An item with `resolved_at is None` is still reported by its source and is
     kept as a suppression record: it must never re-enter the inbox as New.
     """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)  # naive `now` is treated as UTC
     pruned: list[str] = []
     for item_id in list(state.items):
         item = state.items[item_id]
         if item.status not in ("acked", "resolved") or item.resolved_at is None:
             continue
-        resolved = datetime.fromisoformat(item.resolved_at)
+        try:
+            resolved = datetime.fromisoformat(item.resolved_at)
+        except ValueError:
+            _warn(
+                f"item {item_id} has unparseable resolved_at "
+                f"{item.resolved_at!r}; keeping it instead of pruning."
+            )
+            continue
         if resolved.tzinfo is None:
             resolved = resolved.replace(tzinfo=UTC)
         if (now - resolved).days >= retention_days:

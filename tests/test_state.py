@@ -1,7 +1,12 @@
+import fcntl
 import json
+import os
+import stat
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from gitreport.state import (
     AttentionState,
     ItemState,
@@ -56,6 +61,32 @@ def test_corrupt_state_backed_up_and_rebuilt(tmp_path: Path):
     assert len(list(tmp_path.glob("state.json.corrupt-*"))) == 1
 
 
+def test_corrupt_load_warns_on_stderr(tmp_path: Path, capsys):
+    path = tmp_path / "state.json"
+    path.write_text("{not json")
+    state = load_state(path)
+    assert state.items == {}
+    assert state.version == 1
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert str(path) in err
+    assert "backed up" in err
+
+
+def test_corrupt_backup_collision_same_second(tmp_path: Path, monkeypatch):
+    """Two corrupt loads in the same second must yield two distinct backups (UTC)."""
+    frozen = "20260928-120000"
+    monkeypatch.setattr(time, "strftime", lambda *args, **kwargs: frozen)
+    path = tmp_path / "state.json"
+    path.write_text("{one")
+    load_state(path)
+    assert (tmp_path / f"state.json.corrupt-{frozen}").exists()
+    path.write_text("{two")
+    load_state(path)
+    assert (tmp_path / f"state.json.corrupt-{frozen}-1").exists()
+    assert len(list(tmp_path.glob("state.json.corrupt-*"))) == 2
+
+
 def test_record_read_sets_cursor_fields():
     state = AttentionState()
     record_read(state, "2026-09-28T06:00:00+00:00", "2026-09-28T09:14:00+00:00")
@@ -82,7 +113,97 @@ def test_prune_removes_old_acked_and_resolved_items():
     assert "gh:5" in state.items  # still-matching acked item: suppression record
 
 
+def test_prune_boundary_exactly_30_days_is_pruned():
+    now = datetime(2026, 9, 28, tzinfo=UTC)
+    exactly_retention = (now - timedelta(days=30)).isoformat()
+    state = AttentionState()
+    state.items["gh:1"] = make_item(
+        "gh:1", status="acked", acked=True, resolved_at=exactly_retention
+    )[1]
+
+    pruned = prune(state, now)
+
+    assert pruned == ["gh:1"]
+    assert "gh:1" not in state.items
+
+
+def test_prune_accepts_naive_now_as_utc():
+    now = datetime(2026, 9, 28)  # naive: must be treated as UTC, not raise
+    old = (now - timedelta(days=31)).isoformat()
+    state = AttentionState()
+    state.items["gh:1"] = make_item("gh:1", status="acked", acked=True, resolved_at=old)[1]
+
+    assert prune(state, now) == ["gh:1"]
+
+
+def test_prune_keeps_item_with_malformed_resolved_at(capsys):
+    now = datetime(2026, 9, 28, tzinfo=UTC)
+    state = AttentionState()
+    state.items["gh:1"] = make_item(
+        "gh:1", status="acked", acked=True, resolved_at="not-a-timestamp"
+    )[1]
+
+    pruned = prune(state, now)
+
+    assert pruned == []
+    assert "gh:1" in state.items
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_version_2_file_loads_with_warning(tmp_path: Path, capsys):
+    """A newer-version state file must be loaded as-is, never destroyed."""
+    path = tmp_path / "state.json"
+    payload = {"version": 2, "items": {"gh:1": {"status": "acked", "acked": True}}}
+    path.write_text(json.dumps(payload))
+
+    state = load_state(path)
+
+    assert state.version == 2
+    assert "gh:1" in state.items
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "version" in err
+
+
+def test_saved_state_file_permissions_0600(tmp_path: Path):
+    path = tmp_path / "state.json"
+    save_state(path, AttentionState())
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_save_failure_leaves_no_tmp_file(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state.json"
+
+    def explode(*args, **kwargs):
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(os, "replace", explode)
+    with pytest.raises(OSError):
+        save_state(path, AttentionState())
+    assert not (tmp_path / "state.json.tmp").exists()
+    assert not path.exists()
+
+
 def test_state_lock_file_created(tmp_path: Path):
     path = tmp_path / "state.json"
     with state_lock(path):
         assert Path(str(path) + ".lock").exists()
+
+
+def test_state_lock_is_exclusive(tmp_path: Path):
+    path = tmp_path / "state.json"
+    lock_path = Path(str(path) + ".lock")
+    with state_lock(path):
+        # A second, independent fd must not be able to acquire (non-blocking probe).
+        second = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            with pytest.raises(OSError):
+                fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(second)
+    # After release, a fresh non-blocking acquire succeeds.
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
