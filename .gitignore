@@ -112,3 +112,6 @@ venv.bak/
 # Pyflow
 pyflow.lock
 
+# Worktrees
+.worktrees/
+
