@@ -220,3 +220,105 @@ def test_launchpad_merged_and_reviewed_annotates(MockLaunchpad):
     assert len(reviewed) == 1
     assert reviewed[0].get("also_merged") is True
     assert not activity["proj/both"]["prs_merged"]
+
+
+# --- Attention tests ---
+
+
+class MockMp:
+    def __init__(
+        self, web_link, project="~u/+git/repo", votes=None, date_created=None, registrant=None
+    ):
+        self.web_link = web_link
+        self.queue_status = "Needs review"
+        self.votes = votes or []
+        self.date_created = date_created or datetime(2026, 1, 1, tzinfo=UTC)
+        self.registrant = registrant
+        # _mp_repo() reads target_git_repository.unique_name
+        self.target_git_repository = MagicMock(unique_name=f"~u/+git/{project}", private=False)
+
+
+def _lp_provider():
+    with patch("gitreport.providers.launchpad.Launchpad"):
+        provider = LaunchpadProvider(username="testuser", token=None)
+        provider._launchpad.me = MagicMock()
+        provider._launchpad.me.getMergeProposals.return_value = []
+        provider._launchpad.bugs = MagicMock()
+        provider._launchpad.bugs.searchTasks.return_value = []
+        provider._launchpad.load = MagicMock(return_value=None)
+        return provider
+
+
+def _bug_mock(project, status="New", date_last_updated=None):
+    bug = MagicMock()
+    bug.bug_target_name = project
+    bug.web_link = "https://launchpad.net/bugs/77"
+    bug.title = "Bug 77"
+    bug.status = status
+    bug.date_last_updated = date_last_updated or datetime(2026, 9, 27, tzinfo=UTC)
+    bug.bug_target = MagicMock(private=False)
+    return bug
+
+
+def _bug_search_side_effect(assigned=None, subscribed=None):
+    def side_effect(**kwargs):
+        if "assignee" in kwargs:
+            return list(assigned or [])
+        if "bug_subscriber" in kwargs:
+            return list(subscribed or [])
+        return []
+
+    return side_effect
+
+
+def test_lp_mp_needs_review():
+    provider = _lp_provider()
+    provider._launchpad.me.getRequestedReviews.return_value = [
+        MockMp("https://launchpad.net/~u/+git/repo/+merge/1")
+    ]
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["ok"] is True
+    kinds = [i["kind"] for i in fetch["items"]]
+    assert "lp_mp_needs_review" in kinds
+    # Exclusions apply to the MP's repo name.
+    provider._launchpad.me.getRequestedReviews.return_value = [
+        MockMp("https://launchpad.net/~u/+git/noise/+merge/2", project="noise")
+    ]
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), exclusions=["*noise*"])
+    assert fetch["items"] == []
+
+
+def test_lp_assigned_bugs_no_time_window():
+    provider = _lp_provider()
+    # A bug with an old date_last_updated must still appear (parity with GH).
+    provider._launchpad.bugs.searchTasks.side_effect = _bug_search_side_effect(
+        assigned=[_bug_mock("proj", date_last_updated=datetime(2026, 1, 1, tzinfo=UTC))],
+        subscribed=[],
+    )
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    kinds = [i["kind"] for i in fetch["items"]]
+    assert "issue_assigned" in kinds
+
+
+def test_lp_resolved_ids_proven_closed():
+    provider = _lp_provider()
+    provider._launchpad.bugs.searchTasks.side_effect = _bug_search_side_effect()
+    closed_bug = _bug_mock("proj", status="Fix Released")
+    provider._launchpad.load.return_value = closed_bug
+    state_items = {
+        "lp:https://launchpad.net/bugs/77": {
+            "url": "https://launchpad.net/bugs/77",
+            "provider": "launchpad",
+            "status": "open",
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert "lp:https://launchpad.net/bugs/77" in fetch["resolved_ids"]
+
+
+def test_lp_fetch_failure_marks_not_ok():
+    provider = _lp_provider()
+    provider._launchpad.me.getRequestedReviews.side_effect = RuntimeError("lp down")
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["ok"] is False
+    assert "lp down" in fetch["error"]

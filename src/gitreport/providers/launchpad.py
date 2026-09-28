@@ -4,7 +4,14 @@ from pathlib import Path
 
 from launchpadlib.launchpad import Launchpad
 
-from .base import RepoActivity, empty_repo_activity
+from .base import (
+    AttentionFetch,
+    AttentionItem,
+    RepoActivity,
+    empty_repo_activity,
+    escape_user,
+    is_excluded,
+)
 
 LP_CREDENTIALS_PATH = Path(os.path.expanduser("~/.config/gitreport/lp_credentials"))
 
@@ -249,3 +256,128 @@ class LaunchpadProvider:
             activity = repo_for(repo_name, visibility)
             if not any(item["url"] == mp.web_link for item in activity["prs_merged"]):
                 activity["prs_merged"].append({"title": _mp_title(mp), "url": mp.web_link})
+
+    # -- Attention ---------------------------------------------------------
+
+    MP_CLOSED_STATUSES = ("Merged", "Superseded", "Rejected")
+
+    def get_attention(
+        self,
+        since: datetime,
+        exclusions: list[str] | None = None,
+        state_items: dict[str, dict] | None = None,
+        stale_pr_days: int | None = None,
+    ) -> AttentionFetch:
+        """Fetch Launchpad attention items (person-scoped queries)."""
+        try:
+            person = self._launchpad.me
+            items: list[AttentionItem] = []
+
+            # 1. MPs requesting my review (default status: Needs review).
+            for mp in person.getRequestedReviews():
+                name, _visibility = _mp_repo(mp)
+                if is_excluded(name, exclusions):
+                    continue
+                items.append(
+                    self._mp_item(
+                        mp, name, "lp_mp_needs_review", "review requested from you", mp.date_created
+                    )
+                )
+
+            # 2. My MPs with new comments/votes since `since`.
+            for mp in person.getMergeProposals():
+                name, _visibility = _mp_repo(mp)
+                if is_excluded(name, exclusions):
+                    continue
+                latest = self._latest_foreign_event(mp, person, since)
+                if latest is not None:
+                    items.append(
+                        self._mp_item(
+                            mp,
+                            name,
+                            "lp_mp_comment",
+                            "new comment/vote on your merge proposal",
+                            latest,
+                        )
+                    )
+
+            # 3. Bugs assigned to me (open; no time window — GH parity).
+            for bug in self._launchpad.bugs.searchTasks(assignee=person):
+                if is_excluded(bug.bug_target_name, exclusions):
+                    continue
+                items.append(self._bug_item(bug, "issue_assigned", "assigned to you"))
+
+            # 4. Subscribed bugs with activity since `since`.
+            for bug in self._launchpad.bugs.searchTasks(
+                bug_subscriber=person, modified_since=since.isoformat()
+            ):
+                if is_excluded(bug.bug_target_name, exclusions):
+                    continue
+                items.append(
+                    self._bug_item(bug, "lp_bug_activity", "new activity on subscribed bug")
+                )
+
+            return AttentionFetch(
+                ok=True, items=items, resolved_ids=self._proven_resolved(state_items), error=None
+            )
+        except Exception as e:  # noqa: BLE001
+            return AttentionFetch(ok=False, items=[], resolved_ids=[], error=str(e))
+
+    def _mp_item(self, mp, repo_name, kind, reason, updated_at) -> AttentionItem:
+        return AttentionItem(
+            id=f"lp:{mp.web_link}",
+            provider="launchpad",
+            kind=kind,
+            origin="query",
+            repo=repo_name,
+            title=escape_user(_mp_title(mp)),
+            url=mp.web_link,
+            reason=escape_user(reason),
+            updated_at=updated_at.isoformat() if updated_at else None,
+            thread_url=None,
+        )
+
+    def _bug_item(self, bug, kind, reason) -> AttentionItem:
+        return AttentionItem(
+            id=f"lp:{bug.web_link}",
+            provider="launchpad",
+            kind=kind,
+            origin="query",
+            repo=bug.bug_target_name,
+            title=escape_user(bug.title),
+            url=bug.web_link,
+            reason=escape_user(reason),
+            updated_at=(
+                bug.date_last_updated.isoformat()
+                if getattr(bug, "date_last_updated", None)
+                else None
+            ),
+            thread_url=None,
+        )
+
+    def _latest_foreign_event(self, mp, person, since) -> datetime | None:
+        """Latest comment/vote on `mp` after `since` by someone other than me."""
+        latest: datetime | None = None
+        for vote in mp.votes:
+            if _same_person(vote.reviewer, person):
+                continue
+            comment = getattr(vote, "comment", None)
+            when = getattr(comment, "date_created", None) if comment else None
+            if when and when > since and (latest is None or when > latest):
+                latest = when
+        return latest
+
+    def _proven_resolved(self, state_items: dict[str, dict] | None) -> list[str]:
+        """Re-load open LP items from state; report ids proven closed."""
+        resolved: list[str] = []
+        for mid, rec in (state_items or {}).items():
+            if not mid.startswith("lp:") or rec.get("status") != "open":
+                continue
+            try:
+                obj = self._launchpad.load(rec["url"])
+            except Exception:
+                continue  # load failure is not proof
+            status = getattr(obj, "status", None) or getattr(obj, "queue_status", None)
+            if status in CLOSED_BUG_STATUSES or status in self.MP_CLOSED_STATUSES:
+                resolved.append(mid)
+        return resolved
