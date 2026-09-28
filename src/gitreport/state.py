@@ -116,6 +116,29 @@ def _warn_on_version(state: AttentionState, path: Path) -> None:
         )
 
 
+def load_state_with_rebuild_flag(path: Path) -> tuple[AttentionState, bool]:
+    """Load the inbox state, also reporting whether a corrupt file was rebuilt.
+
+    Returns (state, rebuilt): `rebuilt` is True only when a corrupt file was
+    backed up and replaced by an empty state — the caller may then recover
+    recoverable data (e.g. the `last_reviewed` cursor) before saving. The
+    backup rename assumes the caller holds `state_lock`.
+    """
+    state, err = _parse_state(path)
+    if state is None and err is None:
+        return AttentionState(), False  # missing file: not a rebuild
+    if state is None:
+        backup = _corrupt_backup_path(path)
+        os.replace(path, backup)
+        _warn(
+            f"state file {path} was corrupt ({err}); backed up to "
+            f"{backup} and rebuilt empty. Ack/read history is lost."
+        )
+        return AttentionState(), True
+    _warn_on_version(state, path)
+    return state, False
+
+
 def load_state(path: Path) -> AttentionState:
     """Load the inbox state; missing file -> empty, corrupt -> rebuild.
 
@@ -124,20 +147,10 @@ def load_state(path: Path) -> AttentionState:
     than loading data we can still read.
 
     Note: the corrupt-file backup rename assumes the caller holds `state_lock`.
+    Use `load_state_with_rebuild_flag` when the caller needs to know that a
+    rebuild happened (e.g. to recover `last_reviewed` from digest files).
     """
-    state, err = _parse_state(path)
-    if state is None and err is None:
-        return AttentionState()
-    if state is None:
-        backup = _corrupt_backup_path(path)
-        os.replace(path, backup)
-        _warn(
-            f"state file {path} was corrupt ({err}); backed up to "
-            f"{backup} and rebuilt empty. Ack/read history is lost."
-        )
-        return AttentionState()
-    _warn_on_version(state, path)
-    return state
+    return load_state_with_rebuild_flag(path)[0]
 
 
 def load_state_snapshot(path: Path) -> AttentionState:

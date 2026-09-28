@@ -25,6 +25,7 @@ from .state import (
     AttentionState,
     load_state,
     load_state_snapshot,
+    load_state_with_rebuild_flag,
     prune,
     record_read,
     save_state,
@@ -290,7 +291,9 @@ def digest(config_path_str, open_browser):
     with state_lock(att.state_path):
         # Reload under lock; load_state alone now round-trips the merge-layer
         # extras (ItemState carries thread_url/provider).
-        state = load_state(att.state_path)
+        state, rebuilt = load_state_with_rebuild_flag(att.state_path)
+        if rebuilt:
+            _recover_last_reviewed(state, att.digest_output)
         ok_providers = {name for name, fetch in results.items() if fetch["ok"]}
         new_state_obj = AttentionState.model_validate(
             merge_into_state(state.model_dump(), merged, ok_providers, generated_at, resolved_ids)
@@ -338,11 +341,29 @@ def read(config_path_str, open_browser):
     att = config.attention
     now = datetime.now(UTC).isoformat()
     with state_lock(att.state_path):
-        state = load_state(att.state_path)
+        state, rebuilt = load_state_with_rebuild_flag(att.state_path)
+        if rebuilt:
+            _recover_last_reviewed(state, att.digest_output)
         previous = state.last_reviewed
         newest_ts, targets = _digests_generated_after(att.digest_output, previous)
         if newest_ts is None:
             click.echo("No digests to mark read.")
+            return
+        # The cursor only moves forward: a newest digest older than (or as old
+        # as) the cursor — e.g. a recovered cursor, or digests re-generated
+        # with an old date — must not drag last_reviewed backwards and re-cover
+        # already-consumed events. Unparseable timestamps are never "later".
+        newest_dt, previous_dt = _parse(newest_ts), _parse(previous)
+        later = previous is None or (
+            newest_dt is not None and previous_dt is not None and newest_dt > previous_dt
+        )
+        if not later:
+            click.echo("Newest digest is older than your review cursor; not moving it back.")
+            if rebuilt:
+                # The rebuild and the recovered cursor must survive even
+                # though the cursor is not advancing here (the corrupt file
+                # was already backed up).
+                save_state(att.state_path, state)
             return
         record_read(state, newest_ts, now)
         save_state(att.state_path, state)
@@ -550,6 +571,26 @@ def _mark_thread_read(config, thread_url: str) -> None:
         requester.requestJsonAndCheck("PATCH", thread_url)
     except Exception as e:  # noqa: BLE001
         click.echo(f"Warning: could not mark thread read ({e}).", err=True)
+
+
+def _recover_last_reviewed(state: AttentionState, digest_stem: Path) -> None:
+    """Recover the consumption cursor after a corrupt-state rebuild.
+
+    The newest dated digest's front matter is the only surviving record of
+    where the cursor was: its `generated_at` when the body's status line says
+    "Status: Reviewed", else its `coverage_start` (generated but never
+    reviewed). With no digests on disk the cursor stays unset, which falls
+    back to the 24h first-run window. Only called right after `load_state`
+    rebuilt from a corrupt file (digest/read, under the state lock).
+    """
+    newest_ts, targets = _digests_generated_after(digest_stem, None)
+    if newest_ts is None or not targets:
+        return
+    meta, body = strip_front_matter(targets[0].read_text())
+    if "Status: Reviewed" in body:
+        state.last_reviewed = newest_ts
+    else:
+        state.last_reviewed = meta.get("coverage_start")
 
 
 def _digests_generated_after(pattern: Path, previous: str | None) -> tuple[str | None, list[Path]]:

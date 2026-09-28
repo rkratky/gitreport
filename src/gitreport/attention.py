@@ -4,7 +4,6 @@ import copy
 import re
 from datetime import UTC, datetime, timedelta
 
-PRUNE_AFTER = timedelta(days=30)
 MAX_REASONS = 10
 BUCKETS = ("today", "week", "older")
 BUCKET_TITLES = {"today": "Today", "week": "Last 7 days", "older": "Older than 7 days"}
@@ -23,12 +22,14 @@ _URL_UNSAFE = re.compile(r"[\s()<>]")
 _EPOCH = datetime.min.replace(tzinfo=UTC)
 
 
-def _parse(ts: str) -> datetime | None:
+def _parse(ts: str | None) -> datetime | None:
     """Parse an ISO timestamp; naive values are treated as UTC.
 
-    Unparseable input returns None rather than raising: stored state must
-    never abort a merge or report over one malformed field.
+    None and unparseable input return None rather than raising: stored state
+    must never abort a merge or report over one malformed field.
     """
+    if ts is None:
+        return None
     try:
         dt = datetime.fromisoformat(ts)
     except (ValueError, TypeError):
@@ -101,7 +102,12 @@ def merge_into_state(
     generated_at: str,
     resolved_ids: set[str] | frozenset[str] = frozenset(),
 ) -> dict:
-    """Pure: apply enters/reopens/resolutions/prune; return the new state."""
+    """Pure: apply enters/reopens/resolutions; return the new state.
+
+    Retention pruning is deliberately NOT part of the merge: `digest` calls
+    `state.prune` on the merged state under the lock (single prune site; the
+    `attention` dry-run view must not prune either).
+    """
     st = copy.deepcopy(state)
     items = st["items"]
 
@@ -138,6 +144,12 @@ def merge_into_state(
         r["resolved_at"] = None  # a source reports it again
         if m.get("thread_url"):
             r["thread_url"] = m["thread_url"]
+        # An auto-resolved record whose source reports it again is simply
+        # open again: the suppression ended. This is not a new event, so
+        # reopen_count is not bumped (it never left as "re-opened" work).
+        # Acked records keep the new-event-only reopen rule below.
+        if r["status"] == "resolved":
+            r["status"] = "open"
         if new_event:
             r["repo"], r["title"], r["url"] = m["repo"], m["title"], m["url"]
             # The latest event advances freshness for every record, pinned
@@ -145,12 +157,11 @@ def merge_into_state(
             r["last_updated"] = m["updated_at"]
             if r.get("pinned"):
                 pass  # pinned: refresh display only; stays open
-            elif r["status"] in ("acked", "resolved"):
+            elif r["status"] == "acked":
                 r.update(
                     status="open",
                     acked=False,
                     acked_at=None,
-                    resolved_at=None,
                     reopen_count=r.get("reopen_count", 0) + 1,
                 )
 
@@ -168,16 +179,6 @@ def merge_into_state(
                 r["resolved_at"] = generated_at
             elif r["status"] in ("acked", "resolved") and r.get("resolved_at") is None:
                 r["resolved_at"] = generated_at
-
-    # 3. Retention prune.
-    gen = _parse(generated_at)
-    for mid in list(items):
-        r = items[mid]
-        resolved = _parse(r["resolved_at"]) if r.get("resolved_at") else None
-        if r["status"] not in ("acked", "resolved") or resolved is None or gen is None:
-            continue  # unparseable resolved_at: skip, never prune on bad data
-        if (gen - resolved) >= PRUNE_AFTER:
-            del items[mid]
 
     st["last_digest_run"] = generated_at
     return st

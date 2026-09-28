@@ -249,7 +249,10 @@ def _lp_provider():
         return provider
 
 
-def _bug_mock(project, status="New", date_last_updated=None):
+def _bug_mock(project, status="New", date_last_updated=None, messages=None):
+    """A bug-task mock. `messages` must be a list (launchpadlib exposes a
+    paginated collection there); the default carries one foreign-authored
+    message at date_last_updated so the author gate passes."""
     bug = MagicMock()
     bug.bug_target_name = project
     bug.web_link = "https://launchpad.net/bugs/77"
@@ -257,6 +260,15 @@ def _bug_mock(project, status="New", date_last_updated=None):
     bug.status = status
     bug.date_last_updated = date_last_updated or datetime(2026, 9, 27, tzinfo=UTC)
     bug.bug_target = MagicMock(private=False)
+    if messages is None:
+        reporter = MockLaunchpadObject(self_link="https://api.launchpad.net/devel/~otheruser")
+        messages = [
+            MockLaunchpadObject(
+                owner=reporter,
+                date_created=date_last_updated or datetime(2026, 9, 27, tzinfo=UTC),
+            )
+        ]
+    bug.messages = messages
     return bug
 
 
@@ -298,6 +310,41 @@ def test_lp_assigned_bugs_no_time_window():
     fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
     kinds = [i["kind"] for i in fetch["items"]]
     assert "issue_assigned" in kinds
+
+
+def test_lp_bug_self_authored_bump_is_presence_only():
+    """FINAL-02: when the bug's newest message is the user's own, updated_at
+    is None — the self-activity must not refresh or reopen the item."""
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    me.self_link = "https://api.launchpad.net/devel/~testuser"
+    newest_self = MockLaunchpadObject(owner=me, date_created=datetime(2026, 9, 27, tzinfo=UTC))
+    bug = _bug_mock("proj", messages=[newest_self])
+    provider._launchpad.bugs.searchTasks.side_effect = _bug_search_side_effect(
+        assigned=[bug], subscribed=[]
+    )
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert [i["kind"] for i in fetch["items"]] == ["issue_assigned"]
+    assert fetch["items"][0]["updated_at"] is None
+
+
+def test_lp_bug_foreign_newest_message_keeps_freshness():
+    """FINAL-02: a newest message by someone else author-gates the freshness
+    through: updated_at is the bug's date_last_updated."""
+    provider = _lp_provider()
+    foreign = MockLaunchpadObject(self_link="https://api.launchpad.net/devel/~otheruser")
+    bug = _bug_mock(
+        "proj",
+        date_last_updated=datetime(2026, 9, 27, tzinfo=UTC),
+        messages=[
+            MockLaunchpadObject(owner=foreign, date_created=datetime(2026, 9, 26, tzinfo=UTC))
+        ],
+    )
+    provider._launchpad.bugs.searchTasks.side_effect = _bug_search_side_effect(
+        assigned=[bug], subscribed=[]
+    )
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["items"][0]["updated_at"] == "2026-09-27T00:00:00+00:00"
 
 
 def test_lp_resolved_ids_proven_closed():

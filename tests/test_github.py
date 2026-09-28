@@ -1,6 +1,10 @@
+import inspect
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+from github.Requester import Requester
+
+from gitreport.providers.base import escape_user
 from gitreport.providers.github import GitHubProvider
 
 # --- Mock Objects ---
@@ -221,7 +225,8 @@ def _provider_with_notifications(notifications, check_runs=None):
         instance.get_repo.return_value = mock_repo
         instance.search_issues.return_value = []
         empty_search = {"data": {"search": {"pageInfo": {"hasNextPage": False}, "nodes": []}}}
-        instance.requester.graphql_query.return_value = (empty_search, ())
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.return_value = ((), empty_search)
         provider = GitHubProvider(username="testuser", token="fake-token")
         # Keep the mocked client for the call under test (the `with` block
         # only scopes the constructor patch).
@@ -332,7 +337,8 @@ def test_github_notification_and_graphql_share_id():
                 }
             }
         }
-        instance.requester.graphql_query.return_value = (graphql_payload, ())
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.return_value = ((), graphql_payload)
         thread_provider = GitHubProvider(username="testuser", token="fake-token")
         thread_provider._github = instance
         thread_fetch = thread_provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
@@ -454,9 +460,10 @@ def test_github_query_items_kinds():
             return []
 
         instance.search_issues.side_effect = search_side_effect
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
         instance.requester.graphql_query.return_value = (
-            {"data": {"search": {"pageInfo": {"hasNextPage": False}, "nodes": []}}},
             (),
+            {"data": {"search": {"pageInfo": {"hasNextPage": False}, "nodes": []}}},
         )
         provider = GitHubProvider(username="testuser", token="fake-token")
         provider._github = instance
@@ -489,7 +496,8 @@ def test_github_thread_unresolved_via_graphql():
                 }
             }
         }
-        instance.requester.graphql_query.return_value = (graphql_payload, ())
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.return_value = ((), graphql_payload)
         provider = GitHubProvider(username="testuser", token="fake-token")
         provider._github = instance
         fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
@@ -500,8 +508,12 @@ def test_github_thread_unresolved_via_graphql():
     assert fetch["items"][0]["id"] == "gh:https://github.com/o/r/pull/5"
 
 
-def test_github_truncated_review_threads_skip_item(capsys):
-    """A PR with more review threads than the query fetches is skipped entirely."""
+def test_github_truncated_review_threads_emit_item(capsys):
+    """A PR with more review threads than the query fetches still gets its item.
+
+    Dropping it would fabricate an absence and auto-resolve the record even
+    though unresolved state beyond the first 100 threads is unknown (FINAL-04).
+    """
     with patch("gitreport.providers.github.Github") as mock_github_cls:
         instance = mock_github_cls.return_value
         instance.get_user.return_value.get_notifications.return_value = []
@@ -524,13 +536,16 @@ def test_github_truncated_review_threads_skip_item(capsys):
                 }
             }
         }
-        instance.requester.graphql_query.return_value = (truncated, ())
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.return_value = ((), truncated)
         provider = GitHubProvider(username="testuser", token="fake-token")
         provider._github = instance
         fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
 
     assert fetch["ok"] is True
-    assert fetch["items"] == []  # truncated threads: item dropped
+    assert [i["reason"] for i in fetch["items"]] == [
+        escape_user("100+ review threads (truncated); unresolved state unknown")
+    ]
     assert "more than 100 review threads" in capsys.readouterr().err
 
 
@@ -558,7 +573,8 @@ def test_github_excluded_repo_truncation_does_not_warn(capsys):
                 }
             }
         }
-        instance.requester.graphql_query.return_value = (truncated, ())
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.return_value = ((), truncated)
         provider = GitHubProvider(username="testuser", token="fake-token")
         provider._github = instance
         fetch = provider.get_attention(
@@ -591,7 +607,8 @@ def test_github_null_review_threads_does_not_crash():
                 }
             }
         }
-        instance.requester.graphql_query.return_value = (payload, ())
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.return_value = ((), payload)
         provider = GitHubProvider(username="testuser", token="fake-token")
         provider._github = instance
         fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
@@ -625,7 +642,8 @@ def test_github_null_nodes_in_review_threads_does_not_crash():
                 }
             }
         }
-        instance.requester.graphql_query.return_value = (payload, ())
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.return_value = ((), payload)
         provider = GitHubProvider(username="testuser", token="fake-token")
         provider._github = instance
         fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
@@ -658,7 +676,8 @@ def test_github_null_page_info_does_not_crash():
                 }
             }
         }
-        instance.requester.graphql_query.return_value = (payload, ())
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.return_value = ((), payload)
         provider = GitHubProvider(username="testuser", token="fake-token")
         provider._github = instance
         fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
@@ -691,7 +710,8 @@ def test_github_thread_pagination_uses_end_cursor():
             }
         }
         page_two = {"data": {"search": {"pageInfo": {"hasNextPage": False}, "nodes": []}}}
-        instance.requester.graphql_query.side_effect = [(page_one, ()), (page_two, ())]
+        # graphql_query returns (headers, data) — headers first (FINAL-01).
+        instance.requester.graphql_query.side_effect = [((), page_one), ((), page_two)]
         provider = GitHubProvider(username="testuser", token="fake-token")
         provider._github = instance
         fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
@@ -715,3 +735,144 @@ def test_github_fetch_failure_marks_not_ok():
     assert fetch["ok"] is False
     assert "boom" in fetch["error"]
     assert fetch["items"] == []
+
+
+# --- FINAL-01: graphql_query return-order contract (against the real lib) ---
+
+
+def test_graphql_query_returns_headers_first():
+    """Contract with the installed PyGithub: Requester.graphql_query returns
+    (headers, data) — its own docstring documents that order. The provider's
+    unpack must match it; a flipped unpack silently treats headers as the
+    GraphQL payload (and breaks on real data).
+    """
+    doc = inspect.getdoc(Requester.graphql_query)
+    assert doc is not None
+    # "(headers: dict, JSON Response: dict)" — headers documented first.
+    assert doc.index("(headers") < doc.index("JSON Response")
+
+
+# --- FINAL-02: self-activity rule for GraphQL thread items ---
+
+
+def _thread_payload(threads, updated_at="2026-09-27T10:00:00Z"):
+    return {
+        "data": {
+            "search": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "url": "https://github.com/o/r/pull/5",
+                        "title": "PR with threads",
+                        "updatedAt": updated_at,
+                        "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": threads},
+                    }
+                ],
+            }
+        }
+    }
+
+
+def _thread_provider_with(payload):
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = []
+        instance.search_issues.return_value = []
+        instance.requester.graphql_query.return_value = ((), payload)
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    return fetch
+
+
+def test_github_thread_updated_at_ignores_self_last_comment():
+    """updated_at is the newest last-comment NOT authored by the user; the
+    user's own last comments never refresh the item."""
+    threads = [
+        {
+            "isResolved": True,
+            "comments": {
+                "nodes": [{"author": {"login": "testuser"}, "updatedAt": "2026-09-28T09:00:00Z"}]
+            },
+        },
+        {
+            "isResolved": False,
+            "comments": {
+                "nodes": [{"author": {"login": "alice"}, "updatedAt": "2026-09-27T12:00:00Z"}]
+            },
+        },
+    ]
+    fetch = _thread_provider_with(_thread_payload(threads))
+    assert [i["kind"] for i in fetch["items"]] == ["thread_unresolved"]
+    assert fetch["items"][0]["updated_at"] == "2026-09-27T12:00:00Z"
+
+
+def test_github_thread_all_self_last_comments_updated_at_none():
+    """When every visible thread's last comment is the user's own, the PR's
+    updatedAt is NOT trusted (it may be the user's own activity): the item is
+    emitted with updated_at=None — presence-only, no reopen/refresh."""
+    threads = [
+        {
+            "isResolved": False,
+            "comments": {
+                "nodes": [{"author": {"login": "testuser"}, "updatedAt": "2026-09-28T09:00:00Z"}]
+            },
+        }
+    ]
+    fetch = _thread_provider_with(_thread_payload(threads))
+    assert [i["kind"] for i in fetch["items"]] == ["thread_unresolved"]
+    assert fetch["items"][0]["updated_at"] is None
+
+
+def test_github_thread_no_comments_updated_at_none():
+    """Threads without a comments selection (or without comments) leave the
+    item presence-only (updated_at=None), still emitted."""
+    threads = [{"isResolved": False}]
+    fetch = _thread_provider_with(_thread_payload(threads))
+    assert [i["kind"] for i in fetch["items"]] == ["thread_unresolved"]
+    assert fetch["items"][0]["updated_at"] is None
+
+
+# --- FINAL-04: unverifiable ci_activity with an existing record ---
+
+
+def test_github_ci_activity_with_state_record_preserved():
+    """A ci_activity notification whose id already has a state record is
+    re-emitted even when the check-run lookup cannot verify (no false
+    resolution); without a record it is skipped (no fabricated item)."""
+    notification = MockNotification(
+        "ci_activity",
+        subject_url="",
+        subject_type="CheckSuite",  # real shape: null subject url
+        thread_url="https://api.github.com/notifications/threads/1",
+    )
+    state_items = {"gh:https://api.github.com/notifications/threads/1": {"status": "open"}}
+    empty_search = {"data": {"search": {"pageInfo": {"hasNextPage": False}, "nodes": []}}}
+
+    # Unverifiable (get_repo raises) and no record: skipped.
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = [notification]
+        instance.get_repo.side_effect = RuntimeError("api down")
+        instance.search_issues.return_value = []
+        instance.requester.graphql_query.return_value = ((), empty_search)
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["ok"] is True
+    assert fetch["items"] == []
+
+    # Same unverifiable notification, but a record exists: emitted, so the
+    # record is preserved and the absence pass cannot resolve it.
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = [notification]
+        instance.get_repo.side_effect = RuntimeError("api down")
+        instance.search_issues.return_value = []
+        instance.requester.graphql_query.return_value = ((), empty_search)
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert fetch["ok"] is True
+    assert [i["kind"] for i in fetch["items"]] == ["ci_failure"]
+    assert fetch["items"][0]["id"] == "gh:https://api.github.com/notifications/threads/1"

@@ -9,6 +9,7 @@ from gitreport.attention import (
     render_attention_stdout,
     render_digest_markdown,
 )
+from gitreport.state import AttentionState, prune
 
 NOW = "2026-09-28T06:00:00+00:00"
 LATER = "2026-09-29T10:00:00+00:00"
@@ -19,7 +20,7 @@ def item(
     origin="notification",
     kind="mention",
     reason="mentioned you",
-    updated_at=NOW,
+    updated_at: str | None = NOW,
     provider="github",
     **extra,
 ):
@@ -241,7 +242,10 @@ def test_resolved_id_override():
     assert r["status"] == "resolved"
 
 
-def test_retention_prune():
+def test_retention_prune_is_not_part_of_the_merge():
+    """FINAL-07: retention pruning left merge_into_state — it is `state.prune`'s
+    job, called by `digest`. The merge keeps old resolved records; prune drops
+    them (retention covered by test_state.py's prune tests)."""
     old_resolved = "2026-08-01T00:00:00+00:00"
     state = state_with(
         items={
@@ -249,11 +253,18 @@ def test_retention_prune():
             "gh:new": rec(resolved_at="2026-09-27T00:00:00+00:00"),
         }
     )
-    # gh:new is auto-resolved that run and kept because resolved_at is fresh:
-    # the resolution pass stamps resolved_at = generated_at before pruning.
+    # gh:new is auto-resolved that run (absence pass) and kept because its
+    # resolved_at is fresh.
     new_state = merge_into_state(state, {}, {"github"}, "2026-09-28T07:00:00+00:00")
-    assert "gh:old" not in new_state["items"]
+    assert "gh:old" in new_state["items"]  # merge itself no longer prunes
+    assert new_state["items"]["gh:old"]["status"] == "resolved"
     assert "gh:new" in new_state["items"]
+
+    st = AttentionState.model_validate(new_state)
+    pruned = prune(st, datetime.fromisoformat("2026-10-01T07:00:00+00:00"))
+    assert pruned == ["gh:old"]
+    assert "gh:old" not in st.items
+    assert "gh:new" in st.items
 
 
 def test_build_report_new_vs_still_open_disjoint():
@@ -373,8 +384,11 @@ def test_resolved_rereported_then_absent_regains_resolved_at():
     resolved_again = merge_into_state(suppressed, {}, {"github"}, LATER)
     assert resolved_again["items"]["gh:1"]["status"] == "resolved"
     assert resolved_again["items"]["gh:1"]["resolved_at"] == LATER
-    pruned = merge_into_state(resolved_again, {}, {"github"}, "2026-10-30T10:00:00+00:00")
-    assert "gh:1" not in pruned["items"]
+    # Retention prune (FINAL-07: via state.prune, not the merge).
+    st = AttentionState.model_validate(resolved_again)
+    pruned = prune(st, datetime.fromisoformat("2026-10-30T10:00:00+00:00"))
+    assert pruned == ["gh:1"]
+    assert "gh:1" not in st.items
 
 
 def test_acked_absent_keeps_status_and_gains_resolved_at():
@@ -392,7 +406,34 @@ def test_re_report_resets_resolved_at():
         items={"gh:1": rec(status="resolved", resolved_at="2026-09-01T00:00:00+00:00")}
     )
     new_state = merge_into_state(state, merged_with(item(mid="gh:1")), {"github"}, NOW)
+    # FINAL-03: a re-reported resolved record is open again regardless of
+    # event freshness (same updated_at, no new event), resolved_at cleared.
+    assert new_state["items"]["gh:1"]["status"] == "open"
     assert new_state["items"]["gh:1"]["resolved_at"] is None
+    assert new_state["items"]["gh:1"]["reopen_count"] == 0  # not a new event
+
+
+def test_acked_self_activity_bump_stays_acked():
+    """FINAL-02: a same-run re-report with updated_at=None (the provider
+    suppressed a self-authored bump) carries no new event: an acked record
+    must STAY acked."""
+    state = state_with(
+        items={
+            "gh:1": rec(
+                status="acked",
+                acked=True,
+                acked_at="2026-09-28T06:30:00+00:00",
+            )
+        }
+    )
+    new_state = merge_into_state(
+        state, merged_with(item(mid="gh:1", updated_at=None)), {"github"}, LATER
+    )
+    r = new_state["items"]["gh:1"]
+    assert r["status"] == "acked"
+    assert r["acked"] is True
+    assert r["acked_at"] == "2026-09-28T06:30:00+00:00"
+    assert r["reopen_count"] == 0
 
 
 def test_pinned_never_auto_resolves():
@@ -403,22 +444,9 @@ def test_pinned_never_auto_resolves():
     assert r["resolved_at"] is None
 
 
-def test_resolved_still_reported_with_no_resolved_at_not_pruned():
-    # A resolved record whose resolution was suppressed (resolved_at None)
-    # and that is still reported must survive the prune pass.
-    state = state_with(items={"gh:1": rec(status="resolved", resolved_at=None)})
-    new_state = merge_into_state(state, merged_with(item(mid="gh:1")), {"github"}, NOW)
-    assert "gh:1" in new_state["items"]
-    assert new_state["items"]["gh:1"]["resolved_at"] is None
-
-
-def test_exactly_30_days_boundary_prunes():
-    gen = "2026-09-28T07:00:00+00:00"
-    state = state_with(
-        items={"gh:1": rec(status="resolved", resolved_at="2026-08-29T07:00:00+00:00")}
-    )
-    new_state = merge_into_state(state, {}, {"github"}, gen)
-    assert "gh:1" not in new_state["items"]
+# The 30-day boundary and malformed-resolved_at retention behaviours moved to
+# test_state.py's prune tests (FINAL-07: pruning is state.prune's job); a
+# digest-level prune test lives in test_main.py.
 
 
 def test_coverage_line_exact_format(monkeypatch):
@@ -476,12 +504,6 @@ def test_unparseable_first_seen_not_new():
     report = build_report(state, datetime.fromisoformat(NOW))
     assert not report["new"]
     assert [e["id"] for e in report["older"] + report["week"] + report["today"]] == ["gh:1"]
-
-
-def test_unparseable_resolved_at_not_pruned():
-    state = state_with(items={"gh:1": rec(status="resolved", resolved_at="GARBAGE-TS")})
-    new_state = merge_into_state(state, {}, {"github"}, "2027-10-01T00:00:00+00:00")
-    assert "gh:1" in new_state["items"]
 
 
 def test_new_bucket_sorted_newest_first():

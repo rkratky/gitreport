@@ -512,6 +512,133 @@ def test_read_without_digests_is_a_noop(mock_load_config, tmp_path):
 
 
 @patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_recovers_last_reviewed_from_unreviewed_digest(mock_load_config, tmp_path):
+    """FINAL-05: after a corrupt-state rebuild, `digest`/`read` recover
+    last_reviewed from the newest digest's front matter — its coverage_start
+    when the status line is NOT YET REVIEWED."""
+    tmp = tmp_path
+    stem = tmp / "digests" / "2026-09-28"
+    (tmp / "digests").mkdir()
+    (tmp / "digests" / "2026-09-28.md").write_text(
+        "---\n"
+        "generated_at: 2026-09-28T06:00:00+00:00\n"
+        "coverage_start: 2026-09-20T06:00:00+00:00\n"
+        "---\n\n"
+        "# GitReport digest\n\n"
+        "Status: NOT YET REVIEWED — run `gitreport read` after reviewing\n"
+    )
+    (tmp / "state.json").write_text("{corrupt")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json", stem=stem, latest=tmp / "digests" / "latest"
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    state = json.loads((tmp / "state.json").read_text())
+    # Digest never advances the cursor: the recovered coverage_start survives.
+    assert state["last_reviewed"] == "2026-09-20T06:00:00+00:00"
+
+
+@patch("gitreport.main.load_config")
+def test_read_recovers_last_reviewed_from_reviewed_digest(mock_load_config, tmp_path):
+    """FINAL-05: after a corrupt-state rebuild, `read` recovers last_reviewed
+    from the newest digest's generated_at when its status line says Reviewed.
+
+    The newest digest's timestamp equals the recovered cursor, so the
+    forward-only guard blocks record_read (reviewed_at stays unset) — proving
+    recovery, not record_read, placed the cursor; the rebuild+recovery is
+    still persisted.
+    """
+    tmp = tmp_path
+    stem = tmp / "digests" / "2026-09-28"
+    (tmp / "digests").mkdir()
+    (tmp / "digests" / "2026-09-28.md").write_text(
+        "---\n"
+        "generated_at: 2026-09-28T06:00:00+00:00\n"
+        "coverage_start: 2026-09-20T06:00:00+00:00\n"
+        "---\n\n"
+        "# GitReport digest\n\n"
+        "Status: Reviewed Mon 28 Sep 09:14\n"
+    )
+    (tmp / "state.json").write_text("{corrupt")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json", stem=stem, latest=tmp / "digests" / "latest"
+    )
+
+    result = CliRunner().invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    state = json.loads((tmp / "state.json").read_text())
+    assert state["last_reviewed"] == "2026-09-28T06:00:00+00:00"
+    assert state["reviewed_at"] is None
+
+
+@patch("gitreport.main.load_config")
+def test_read_does_not_move_cursor_back(mock_load_config, tmp_path):
+    """FINAL-06: `read` never moves the cursor backwards; a hand-aged digest
+    (generated_at older than the cursor) leaves the cursor untouched."""
+    from gitreport.state import save_state
+
+    tmp = tmp_path
+    stem = tmp / "digests" / "2026-09-28"
+    (tmp / "digests").mkdir()
+    (tmp / "digests" / "2026-09-28.md").write_text(
+        "---\n"
+        "generated_at: 2026-09-28T06:00:00+00:00\n"
+        "coverage_start: 2026-09-27T06:00:00+00:00\n"
+        "---\n\n"
+        "# GitReport digest\n\n"
+        "Status: NOT YET REVIEWED — run `gitreport read` after reviewing\n"
+    )
+    state = AttentionState(
+        last_reviewed="2026-09-28T12:00:00+00:00",
+        reviewed_at="2026-09-28T13:00:00+00:00",
+    )
+    save_state(tmp / "state.json", state)
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json", stem=stem, latest=tmp / "digests" / "latest"
+    )
+
+    result = CliRunner().invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    assert "Newest digest is older than your review cursor" in result.output
+    saved = json.loads((tmp / "state.json").read_text())
+    assert saved["last_reviewed"] == "2026-09-28T12:00:00+00:00"  # unchanged
+    assert saved["reviewed_at"] == "2026-09-28T13:00:00+00:00"  # unchanged
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_prunes_old_resolved_items(mock_load_config, tmp_path):
+    """FINAL-07: retention pruning runs via state.prune on the merged state."""
+    from datetime import UTC, timedelta
+
+    from gitreport.state import save_state
+
+    item_id = "mock:https://github.com/o/r/pull/40"
+    old_resolved = (datetime.now(UTC) - timedelta(days=40)).isoformat()
+    state = AttentionState()
+    state.items[item_id] = _seed_item(
+        item_id, status="resolved", resolved_at=old_resolved, provider="mock"
+    )
+    save_state(tmp_path / "state.json", state)
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=tmp_path / "digests" / "2026-09-28",
+        latest=tmp_path / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert item_id not in saved["items"]
+
+
+@patch("gitreport.main.load_config")
 def test_ack_prompts_outside_the_state_lock(mock_load_config, tmp_path):
     """BUG-02: the disambiguation prompt must not hold the state lock.
 

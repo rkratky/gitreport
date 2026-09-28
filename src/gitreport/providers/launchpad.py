@@ -326,7 +326,7 @@ class LaunchpadProvider:
             for bug in self._launchpad.bugs.searchTasks(assignee=person):
                 if is_excluded(bug.bug_target_name, exclusions):
                     continue
-                items.append(self._bug_item(bug, "issue_assigned", "assigned to you"))
+                items.append(self._bug_item(bug, person, "issue_assigned", "assigned to you"))
 
             # 4. Subscribed bugs with activity since `since`.
             for bug in self._launchpad.bugs.searchTasks(
@@ -335,7 +335,7 @@ class LaunchpadProvider:
                 if is_excluded(bug.bug_target_name, exclusions):
                     continue
                 items.append(
-                    self._bug_item(bug, "lp_bug_activity", "new activity on subscribed bug")
+                    self._bug_item(bug, person, "lp_bug_activity", "new activity on subscribed bug")
                 )
 
             return AttentionFetch(
@@ -378,7 +378,52 @@ class LaunchpadProvider:
             thread_url=None,
         )
 
-    def _bug_item(self, bug, kind, reason) -> AttentionItem:
+    @staticmethod
+    def _bug_messages(bug):
+        """The bug's message collection, whether `bug` is a bug or a bug task.
+
+        searchTasks returns bug *tasks*; the messages live on the underlying
+        bug (task.bug.messages). A missing attribute on either level means the
+        stream is unavailable (launchpadlib raises AttributeError lazily, so
+        getattr-with-default is the right probe).
+        """
+        messages = getattr(bug, "messages", None)
+        if messages is None:
+            bug_entry = getattr(bug, "bug", None)
+            if bug_entry is not None:
+                messages = getattr(bug_entry, "messages", None)
+        return messages
+
+    def _bug_updated_at(self, bug, person) -> str | None:
+        """Freshness timestamp for a bug item, or None (presence-only).
+
+        Self-activity rule: the timestamp is only used when the bug's newest
+        message was authored by someone other than the user — walk
+        `bug.messages` to find that author (`date_last_updated` itself cannot
+        be author-gated, so it is kept only as the reported time once the
+        author check passes). When messages are unavailable or the newest
+        message is the user's own, `updated_at` is None: the item stays in
+        the inbox by presence, but no event (refresh/reopen) is derived from
+        it.
+
+        Perf note: walking `bug.messages` costs an extra launchpadlib
+        collection round-trip per bug (plus one for `bug.bug` on tasks);
+        bounded by the number of assigned/subscribed bugs in the inbox.
+        """
+        messages = self._bug_messages(bug)
+        if messages is None:
+            return None
+        newest, newest_owner = None, None
+        for message in messages:
+            when = getattr(message, "date_created", None)
+            if when is not None and (newest is None or when > newest):
+                newest, newest_owner = when, getattr(message, "owner", None)
+        if newest is None or _same_person(newest_owner, person):
+            return None
+        last_updated = getattr(bug, "date_last_updated", None)
+        return (last_updated or newest).isoformat()
+
+    def _bug_item(self, bug, person, kind, reason) -> AttentionItem:
         return AttentionItem(
             id=f"lp:{bug.web_link}",
             provider="launchpad",
@@ -388,11 +433,7 @@ class LaunchpadProvider:
             title=escape_user(bug.title),
             url=bug.web_link,
             reason=escape_user(reason),
-            updated_at=(
-                bug.date_last_updated.isoformat()
-                if getattr(bug, "date_last_updated", None)
-                else None
-            ),
+            updated_at=self._bug_updated_at(bug, person),
             thread_url=None,
         )
 

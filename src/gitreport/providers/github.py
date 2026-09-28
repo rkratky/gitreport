@@ -30,11 +30,35 @@ query($q: String!, $cursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest {
       url title updatedAt
-      reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved } }
+      reviewThreads(first: 100) {
+        pageInfo { hasNextPage }
+        nodes {
+          isResolved
+          comments(last: 1) { nodes { author { login } updatedAt } }
+        }
+      }
     } }
   }
 }
 """
+
+
+def _max_timestamp(current: str | None, candidate: str | None) -> str | None:
+    """The later of two ISO-8601 timestamps; None/unparseable never wins.
+
+    Parse-based (not string) comparison: a "Z" and a "+00:00" suffix denote
+    the same instant and must not compare as different.
+    """
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+    try:
+        current_dt = datetime.fromisoformat(current)
+        candidate_dt = datetime.fromisoformat(candidate)
+    except ValueError:
+        return current
+    return candidate if candidate_dt > current_dt else current
 
 
 class GitHubProvider:
@@ -189,7 +213,7 @@ class GitHubProvider:
             thread_url=thread_url,
         )
 
-    def _notification_items(self, exclusions) -> list[AttentionItem]:
+    def _notification_items(self, exclusions, state_items) -> list[AttentionItem]:
         items: list[AttentionItem] = []
         for n in self._github.get_user().get_notifications(all=False):
             subject_url = getattr(n.subject, "url", "") or ""
@@ -206,16 +230,6 @@ class GitHubProvider:
                 full_name = match.group(1) if match else ""
             if is_excluded(full_name, exclusions):
                 continue
-            reason = n.reason
-            if reason == "ci_activity":
-                if not self._ci_failed(full_name, subject_url):
-                    continue
-                kind = "ci_failure"
-            else:
-                kind = GH_REASON_KIND.get(reason)
-                if kind is None:
-                    continue  # subscribed, state_change, manual, etc.
-            title = getattr(n.subject, "title", "") or ""
             if subject_type in ("PullRequest", "Issue", "Commit") and subject_url:
                 # Convert the subject API url to its html url for display:
                 # api.github.com/repos/o/r/pulls/3 -> github.com/o/r/pull/3
@@ -238,11 +252,30 @@ class GitHubProvider:
                 # id must come from the unique per-notification thread api
                 # url — otherwise dedupe folds distinct releases into one.
                 id_url = thread_url
+            item_id = f"gh:{id_url or thread_url}"
+            reason = n.reason
+            if reason == "ci_activity":
+                # An unverifiable ci_activity notification must not fabricate a
+                # new item. But when a state record with this id already exists
+                # (e.g. a previously verified failure whose check-run lookup
+                # now fails), re-emit it: the fetch then still reports the
+                # item, so no absence-based resolution fires on unverified
+                # data and the existing record (and its freshness) is kept.
+                if item_id not in (state_items or {}) and not self._ci_failed(
+                    full_name, subject_url
+                ):
+                    continue
+                kind = "ci_failure"
+            else:
+                kind = GH_REASON_KIND.get(reason)
+                if kind is None:
+                    continue  # subscribed, state_change, manual, etc.
+            title = getattr(n.subject, "title", "") or ""
             items.append(
                 self._item(
                     # Ids use the html url form so query/GraphQL-origin items
                     # for the same PR dedupe against notification items.
-                    mid=f"gh:{id_url or thread_url}",
+                    mid=item_id,
                     provider="github",
                     kind=kind,
                     origin="notification",
@@ -262,7 +295,9 @@ class GitHubProvider:
         v1 limitation: GitHub sends ci_activity notifications with a
         CheckSuite subject and null url; those are skipped here — failing
         checks on the user's own PRs are still caught by the status:failure
-        search query.
+        search query. The caller re-emits a notification whose id already has
+        a state record even when this cannot verify, so no absence-based
+        resolution fires on unverified data.
         """
         try:
             number = int(subject_url.rsplit("/", 1)[1])
@@ -276,10 +311,17 @@ class GitHubProvider:
             return False  # cannot verify -> skip, never fabricate a failure
 
     def _search_item(self, issue, kind: str, reason: str, exclusions) -> AttentionItem | None:
+        """A query-origin item for a search match.
+
+        Presence-only: `updated_at` is None because a search result carries no
+        author information — the PR/issue's own updatedAt may be the user's own
+        activity, which must never refresh or reopen an item. Reopens come
+        from notification-origin events; presence keeps the item in the inbox
+        and lets absence-resolution see it.
+        """
         repo_full = issue.repository.full_name
         if is_excluded(repo_full, exclusions):
             return None
-        updated = getattr(issue, "updated_at", None)
         return self._item(
             mid=f"gh:{issue.html_url}",
             provider="github",
@@ -289,17 +331,36 @@ class GitHubProvider:
             title=issue.title,
             url=issue.html_url,
             reason=reason,
-            updated_at=updated.isoformat() if updated else None,
+            updated_at=None,
         )
 
     def _unresolved_thread_items(self, exclusions) -> list[AttentionItem]:
+        """Unresolved review threads on the user's own open PRs.
+
+        `updated_at` follows the self-activity rule: it is the newest
+        thread-comment (each thread's last comment) whose author is not the
+        user, across the visible threads. When every visible thread's last
+        comment is the user's own — or there is none — the PR's own
+        `updatedAt` is NOT used (search cannot tell whether the PR was last
+        touched by the user), so the item is emitted with `updated_at=None`:
+        its presence keeps it in the inbox, but no event (refresh/reopen) is
+        derived from it.
+
+        Truncated threads (more than `first: 100`): the item is still emitted
+        rather than dropped — dropping would fabricate an absence and
+        auto-resolve the record even though unresolved state beyond the first
+        100 is unknown. The reason then reads "100+ review threads
+        (truncated); unresolved state unknown".
+        """
         items: list[AttentionItem] = []
         cursor = None
         while True:
             variables = {"q": f"is:pr is:open author:{self._username}"}
             if cursor:
                 variables["cursor"] = cursor
-            payload, _headers = self._github.requester.graphql_query(
+            # Requester.graphql_query returns (headers, data) — headers first
+            # (contract with the installed PyGithub; see its docstring).
+            response_headers, payload = self._github.requester.graphql_query(
                 REVIEW_THREADS_QUERY, variables
             )
             search = payload["data"]["search"]
@@ -317,19 +378,31 @@ class GitHubProvider:
                 # None), so `or {}` guards are required — `.get(key, {})`
                 # would pass the null straight through.
                 thread_data = node.get("reviewThreads") or {}
-                if (thread_data.get("pageInfo") or {}).get("hasNextPage"):
-                    # Truncated threads: item dropped rather than risk false
-                    # resolution (we cannot see threads beyond the first 100).
+                threads = thread_data.get("nodes") or []
+                truncated = bool((thread_data.get("pageInfo") or {}).get("hasNextPage"))
+                unresolved = [t for t in threads if not t.get("isResolved")]
+                if not unresolved and not truncated:
+                    continue
+                if truncated:
+                    # Truncated threads: emit instead of dropping (a drop
+                    # would fabricate an absence); unresolved state beyond
+                    # the first 100 is unknown.
                     print(
                         f"Warning: {node.get('url')} has more than 100 review "
-                        "threads; skipping its unresolved-thread item.",
+                        "threads; unresolved state beyond the first 100 is unknown.",
                         file=sys.stderr,
                     )
-                    continue
-                threads = thread_data.get("nodes") or []
-                if not any(not t.get("isResolved") for t in threads):
-                    continue
-                unresolved = sum(1 for t in threads if not t.get("isResolved"))
+                    reason = "100+ review threads (truncated); unresolved state unknown"
+                else:
+                    reason = f"{len(unresolved)} unresolved review thread(s)"
+                newest_foreign = None
+                for thread in threads:
+                    comments = (thread.get("comments") or {}).get("nodes") or []
+                    for comment in comments:
+                        author = (comment.get("author") or {}).get("login")
+                        if author == self._username:
+                            continue  # self-activity never refreshes an item
+                        newest_foreign = _max_timestamp(newest_foreign, comment.get("updatedAt"))
                 items.append(
                     self._item(
                         mid=f"gh:{node['url']}",
@@ -339,8 +412,8 @@ class GitHubProvider:
                         repo=repo_full,
                         title=node.get("title", ""),
                         url=node["url"],
-                        reason=f"{unresolved} unresolved review thread(s)",
-                        updated_at=node.get("updatedAt"),
+                        reason=reason,
+                        updated_at=newest_foreign,
                     )
                 )
             page = search["pageInfo"]
@@ -359,7 +432,7 @@ class GitHubProvider:
         """Fetch GitHub attention items (notifications + queries)."""
         try:
             items: list[AttentionItem] = []
-            items.extend(self._notification_items(exclusions))
+            items.extend(self._notification_items(exclusions, state_items))
 
             failing_checks_q = f"is:pr is:open author:{self._username} status:failure"
             for issue in self._github.search_issues(failing_checks_q):
