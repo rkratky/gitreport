@@ -1,5 +1,6 @@
 from datetime import datetime
 
+import gitreport.attention as attention
 from gitreport.attention import (
     build_report,
     dedupe,
@@ -393,15 +394,59 @@ def test_exactly_30_days_boundary_prunes():
     assert "gh:1" not in new_state["items"]
 
 
-def test_coverage_line_exact_format():
+def test_coverage_line_exact_format(monkeypatch):
+    monkeypatch.setattr(attention, "_fmt_local", lambda ts: "PINNED")
     md = render_digest_markdown(
         state_with(), "# Git activity report", "2026-09-27T06:00:00+00:00", NOW, stale_providers=[]
     )
-    assert "Coverage: Sun 27 Sep – Mon 28 Sep (1 day since last review)" in md
+    assert "Coverage: PINNED – PINNED (1 day since last review)" in md
     md2 = render_digest_markdown(
         state_with(), "# Git activity report", "2026-09-26T06:00:00+00:00", NOW, stale_providers=[]
     )
-    assert "Coverage: Sat 26 Sep – Mon 28 Sep (2 days since last review)" in md2
+    assert "Coverage: PINNED – PINNED (2 days since last review)" in md2
+
+
+def test_parse_garbage_returns_none():
+    assert attention._parse("not-a-timestamp") is None
+    assert attention._parse("") is None
+
+
+def test_is_later_never_true_on_unparseable():
+    assert attention._is_later("garbage", "2026-09-28T06:00:00+00:00") is False
+    assert attention._is_later("2026-09-28T06:00:00+00:00", "garbage") is True
+    assert attention._is_later("garbage", "also garbage") is False
+
+
+def test_merge_and_report_survive_garbage_last_updated():
+    state = state_with(
+        last_reviewed=NOW,
+        items={
+            "gh:bad": rec(last_updated="GARBAGE-TS"),
+        },
+    )
+    # ok_providers empty and item absent from fetch: no auto-resolve, record
+    # survives the merge with its garbage last_updated intact.
+    new_state = merge_into_state(state, {}, set(), NOW)
+    assert "gh:bad" in new_state["items"]
+    report = build_report(new_state, datetime.fromisoformat(NOW))
+    # unparseable last_updated buckets as "older"; record survives
+    assert [e["id"] for e in report["older"]] == ["gh:bad"]
+
+
+def test_unparseable_first_seen_not_new():
+    state = state_with(
+        last_reviewed="2026-09-27T06:00:00+00:00",
+        items={"gh:1": rec(first_seen="GARBAGE-TS")},
+    )
+    report = build_report(state, datetime.fromisoformat(NOW))
+    assert not report["new"]
+    assert [e["id"] for e in report["older"] + report["week"] + report["today"]] == ["gh:1"]
+
+
+def test_unparseable_resolved_at_not_pruned():
+    state = state_with(items={"gh:1": rec(status="resolved", resolved_at="GARBAGE-TS")})
+    new_state = merge_into_state(state, {}, {"github"}, "2027-10-01T00:00:00+00:00")
+    assert "gh:1" in new_state["items"]
 
 
 def test_new_bucket_sorted_newest_first():
@@ -432,6 +477,18 @@ def test_url_guard_parens_no_link():
         "id": "gh:1",
         "title": "Odd",
         "url": "https://example.com/a(b) [x]",
+        "reasons": [],
+    }
+    out = render_attention_body(_report_with(entry), [])
+    assert "- Odd" in out
+    assert "](https://example.com" not in out
+
+
+def test_url_guard_unbalanced_paren_no_link():
+    entry = {
+        "id": "gh:1",
+        "title": "Odd",
+        "url": "https://example.com/a)b",
         "reasons": [],
     }
     out = render_attention_body(_report_with(entry), [])

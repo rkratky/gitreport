@@ -15,20 +15,33 @@ _URL_UNSAFE = re.compile(r"[\s()<>]")
 _EPOCH = datetime.min.replace(tzinfo=UTC)
 
 
-def _parse(ts: str) -> datetime:
-    """Parse an ISO timestamp; naive values are treated as UTC."""
-    dt = datetime.fromisoformat(ts)
+def _parse(ts: str) -> datetime | None:
+    """Parse an ISO timestamp; naive values are treated as UTC.
+
+    Unparseable input returns None rather than raising: stored state must
+    never abort a merge or report over one malformed field.
+    """
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
 
 
 def _is_later(a: str | None, b: str | None) -> bool:
+    """True when a is strictly after b. None / unparseable is never 'later'."""
     if a is None:
         return False
     if b is None:
         return True
-    return _parse(a) > _parse(b)
+    a_dt, b_dt = _parse(a), _parse(b)
+    if a_dt is None:
+        return False
+    if b_dt is None:
+        return True
+    return a_dt > b_dt
 
 
 def dedupe(results: dict[str, dict]) -> dict[str, dict]:
@@ -148,9 +161,10 @@ def merge_into_state(
     gen = _parse(generated_at)
     for mid in list(items):
         r = items[mid]
-        if r["status"] not in ("acked", "resolved") or r.get("resolved_at") is None:
-            continue
-        if (gen - _parse(r["resolved_at"])) >= PRUNE_AFTER:
+        resolved = _parse(r["resolved_at"]) if r.get("resolved_at") else None
+        if r["status"] not in ("acked", "resolved") or resolved is None or gen is None:
+            continue  # unparseable resolved_at: skip, never prune on bad data
+        if (gen - resolved) >= PRUNE_AFTER:
             del items[mid]
 
     st["last_digest_run"] = generated_at
@@ -166,9 +180,11 @@ def build_report(state: dict, now: datetime) -> dict:
         if r.get("status") != "open":
             continue
         first_seen = r.get("first_seen") or ""
-        is_new = not last_reviewed or (
-            first_seen != "" and _parse(first_seen) > _parse(last_reviewed)
-        )
+        fs = _parse(first_seen)
+        lr = _parse(last_reviewed) if last_reviewed else None
+        # unparseable first_seen is treated as not-New (defensive: bad stored
+        # data must not promote an item into the New bucket).
+        is_new = lr is None or (fs is not None and fs > lr)
         entry = {
             "id": mid,
             "repo": r.get("repo", ""),
@@ -184,24 +200,30 @@ def build_report(state: dict, now: datetime) -> dict:
     now_local = now.astimezone()
     for entry in still_open:
         lu = entry["last_updated"]
-        when = _parse(lu).astimezone() if lu else None
-        if when is None or when.date() == now_local.date():
+        when = _parse(lu) if lu else None
+        when = when.astimezone() if when is not None else None
+        # unparseable last_updated buckets as "older" (defensive).
+        if when is not None and when.date() == now_local.date():
             bucket = "today"
-        elif when >= now_local - timedelta(days=7):
+        elif when is not None and when >= now_local - timedelta(days=7):
             bucket = "week"
         else:
             bucket = "older"
         buckets[bucket].append(entry)
 
-    new_items.sort(
-        key=lambda e: _parse(e["last_updated"]) if e["last_updated"] else _EPOCH,
-        reverse=True,
-    )
+    def _sort_key(e: dict) -> datetime:
+        dt = _parse(e["last_updated"]) if e["last_updated"] else None
+        return dt if dt is not None else _EPOCH
+
+    new_items.sort(key=_sort_key, reverse=True)
     return {"new": new_items, **buckets}
 
 
 def _fmt_local(ts: str) -> str:
-    dt = _parse(ts).astimezone()
+    dt = _parse(ts)
+    if dt is None:
+        return "?"
+    dt = dt.astimezone()
     return f"{dt:%a} {dt.day} {dt:%b}"
 
 
@@ -258,13 +280,16 @@ def render_digest_markdown(
 ) -> str:
     start_dt = _parse(coverage_start)
     end_dt = _parse(generated_at)
-    days = max(1, (end_dt - start_dt).days)
+    if start_dt is None or end_dt is None:
+        days = 1  # defensive: unparseable coverage bounds degrade to 1 day
+    else:
+        days = max(1, (end_dt - start_dt).days)
     unit = "day" if days == 1 else "days"
     coverage = (
         f"Coverage: {_fmt_local(coverage_start)} – {_fmt_local(generated_at)} "
         f"({days} {unit} since last review)"
     )
-    report = build_report(state, end_dt)
+    report = build_report(state, end_dt if end_dt is not None else _EPOCH)
     lines = [
         "---",
         f"generated_at: {generated_at}",
