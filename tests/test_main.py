@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
+
 from gitreport.config import Config, ProviderConfig
 from gitreport.main import cli
 from gitreport.providers.base import GitProvider

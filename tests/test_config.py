@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+
 from gitreport.config import Config, load_config
 
 
