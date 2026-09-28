@@ -91,6 +91,8 @@ def load_state(path: Path) -> AttentionState:
     A file written by another release (version != 1) is loaded as-is with a
     stderr warning: rebuilding would destroy ack/read history, which is worse
     than loading data we can still read.
+
+    Note: the corrupt-file backup rename assumes the caller holds `state_lock`.
     """
     if not path.exists():
         return AttentionState()
@@ -118,15 +120,18 @@ def save_state(path: Path, state: AttentionState) -> None:
     """Atomically and durably write the state (tmp 0600 + fsync + rename + dir fsync).
 
     A crash at any point must never leave an empty or truncated state.json.
+
+    Note: may raise after a successful rename if the directory fsync fails (data already durable).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
+            os.fchmod(fd, 0o600)  # a stale tmp file may carry an older mode: force 0600
             f = os.fdopen(fd, "w")
         except BaseException:
-            os.close(fd)  # fdopen failed, so nothing owns the fd yet
+            os.close(fd)  # fchmod/fdopen failed, so nothing owns the fd yet
             raise
         with f:
             f.write(json.dumps(state.model_dump(), indent=2))

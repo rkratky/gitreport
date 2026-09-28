@@ -71,6 +71,7 @@ def test_corrupt_load_warns_on_stderr(tmp_path: Path, capsys):
     assert "WARNING" in err
     assert str(path) in err
     assert "backed up" in err
+    assert "Ack/read history is lost" in err
 
 
 def test_corrupt_backup_collision_same_second(tmp_path: Path, monkeypatch):
@@ -168,6 +169,18 @@ def test_version_2_file_loads_with_warning(tmp_path: Path, capsys):
 def test_saved_state_file_permissions_0600(tmp_path: Path):
     path = tmp_path / "state.json"
     save_state(path, AttentionState())
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_stale_tmp_file_mode_is_forced_to_0600(tmp_path: Path):
+    """A pre-existing stale tmp file must not leak its old mode into state.json."""
+    path = tmp_path / "state.json"
+    tmp = tmp_path / "state.json.tmp"
+    tmp.write_text("stale")
+    tmp.chmod(0o666)
+
+    save_state(path, AttentionState())
+
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
