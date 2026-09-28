@@ -9,6 +9,8 @@ A CLI tool to gather a user's Git activity from configured Git providers (e.g., 
 *   Reports PRs/merge proposals submitted, reviewed, and merged (when merged by
     the user but authored by someone else), plus issues/bugs created and closed.
 *   Empty categories, repositories, and providers are omitted from the report.
+*   Attention digest: a daily "what needs my attention" inbox with an
+    ack/unack lifecycle, catch-up-safe scheduling, and Markdown/HTML digests.
 *   Configurable via a YAML file.
 *   Flexible date handling, including natural language.
 
@@ -61,7 +63,7 @@ The tool requires a configuration file to access Git providers.
     providers:
       github:
         username: "your-github-username"
-        token: "your-github-personal-access-token" # Needs repo and user scopes
+        token: "your-github-personal-access-token"  # Classic PAT: repo + user scopes, plus notifications for the attention digest
       launchpad:
         username: "your-launchpad-id"
         # No token needed; Launchpad auth uses saved OAuth credentials (below).
@@ -137,3 +139,192 @@ poetry run gitreport generate [OPTIONS]
     ```bash
     poetry run gitreport generate --start-date "last Tuesday"
     ```
+
+## Attention digest
+
+Beyond the standalone `generate` report, gitreport can run as a **daily
+digest**: each morning it collects what needs your attention (GitHub
+notifications and queries, Launchpad items) plus your recent activity, writes
+the digest to disk, and keeps an inbox-style state so items stop nagging once
+you have dealt with them.
+
+### Commands
+
+*   `gitreport attention`: print the attention report to stdout. A dry run —
+    it does not mutate state; items not yet in state show as `New`.
+*   `gitreport digest`: the morning run — attention plus activity since your
+    last review; updates state (first-seen marking, reopens, resolutions,
+    prune); writes the dated digest and refreshes the `latest` links; prints
+    the digest Markdown. `--open` opens the digest in a browser. Does **not**
+    advance the review cursor.
+*   `gitreport read`: mark the newest digest(s) consumed (on the first-ever
+    read, only the newest digest) and re-render their status line. `--open`
+    also opens `latest`.
+*   `gitreport ack [ID]`: mark item(s) done. `ID` is an item id or substring
+    (interactive disambiguation when ambiguous); `--list` (or no `ID`)
+    browses open items. Acking a GitHub-notification item also marks that
+    thread read on GitHub (best effort).
+*   `gitreport unack <ID>`: pull item(s) back into the inbox.
+
+```bash
+poetry run gitreport digest         # morning run: writes and prints the digest
+poetry run gitreport read --open    # done reading; opens the latest digest
+poetry run gitreport ack --list     # browse the inbox
+poetry run gitreport ack 123        # ack by id or substring
+```
+
+### The banner: coverage and status lines
+
+Every digest starts with two lines that have different lifetimes:
+
+*   **Coverage line** — frozen at generation, always historically true:
+
+    ```text
+    Coverage: Mon 22 Sep – Mon 28 Sep (6 days since last review)
+    ```
+
+    On a first-ever run the start is a 24-hour fallback.
+
+*   **Status line** — live; re-rendered in place by `gitreport read` for
+    every digest generated since your previous read:
+
+    ```text
+    Status: NOT YET REVIEWED — run `gitreport read` after reviewing
+    ```
+
+    becomes
+
+    ```text
+    Status: Reviewed Mon 28 Sep 09:14
+    ```
+
+    This is the nudge when a digest was generated but never reviewed — there
+    is deliberately no interactive prompt at generation time, so cron can
+    never hang.
+
+### Reading and the review cursor
+
+`gitreport read` sets the review cursor to the **newest digest's generation
+timestamp — not the wall clock**. Events that happen between a digest being
+generated and you reading it therefore fall after the cursor and appear in
+the next digest's coverage window: nothing is lost if you read yesterday's
+digest a day late. Generating digests never advances the cursor; only
+`gitreport read` does.
+
+### Item lifecycle
+
+Items move from **open** (in the inbox) to **acked** (you marked them done)
+or **resolved** (auto-resolved because every source stopped reporting them
+while unacked). New activity by someone other than you reopens an item.
+`gitreport unack` pulls an item back into the inbox; un-acking a *resolved*
+item pins it open until you ack it again, regardless of source state.
+
+## Scheduling
+
+The digest is designed to run once a day from a scheduler. All report windows
+are anchored to saved state, not the calendar, so a missed day costs nothing:
+the next digest covers the entire gap in a single catch-up digest (the tool
+does not synthesise digests for days that never ran).
+
+### systemd user timer
+
+```ini
+# ~/.config/systemd/user/gitreport-digest.service
+[Unit]
+Description=GitReport daily digest
+
+[Service]
+Type=oneshot
+ExecStart=%h/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest
+```
+
+```ini
+# ~/.config/systemd/user/gitreport-digest.timer
+[Unit]
+Description=Run gitreport digest every morning
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Then enable the timer:
+
+```bash
+systemctl --user enable --now gitreport-digest.timer
+```
+
+`%h` expands to your home directory. Substitute your actual Poetry virtualenv
+path in `ExecStart` — `poetry env info --path` prints it (with in-project
+virtualenvs it is `<repo>/.venv`). The entrypoint is called directly from the
+venv's `bin/`; no `poetry run` wrapper is needed.
+
+`Persistent=true` makes the timer fire shortly after boot/resume if the
+schedule elapsed while the machine was off, so the catch-up digest is
+typically ready the morning you return.
+
+### cron equivalent
+
+```cron
+30 7 * * * $HOME/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest
+```
+
+Plain cron simply runs at the next scheduled time; coverage is identical
+either way because windows are state-anchored.
+
+### Caveats
+
+*   **GitHub expires unread notifications after ~3 months.** An absence
+    longer than that can lose notification-derived items (mentions, comments,
+    review requests). Query-derived items (assigned issues, unresolved review
+    threads, failing checks, stale PRs) and all Launchpad items are
+    query-based and survive any absence.
+*   The GitHub notifications API does not support fine-grained personal
+    access tokens: a **classic PAT with the `notifications` scope** is
+    required for the digest's notification-derived items.
+
+## Config reference: the `attention:` block
+
+The `attention:` block is optional — everything defaults as shown below, so
+existing configurations keep working.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `exclusions` | `{}` | Per-provider glob patterns matched against `owner/repo` (GitHub) or the project name (Launchpad). Applies to attention items only; the activity report is unchanged. |
+| `stale_pr_days` | `7` | Flag your open PRs as stale after this many days without updates. |
+| `state_path` | `~/.local/state/gitreport/state.json` | Location of the inbox state file (see [State file](#state-file)). |
+| `digest_formats` | `[html, md]` | Published digest formats. The `.md` file is always written (it is infrastructure for `gitreport read`); omitting it is a configuration error. Omitting `html` skips the HTML file and makes `--open` open the `.md`. |
+| `digest_output` | `~/.local/state/gitreport/digests/YYYY-MM-DD` | Extension-less stem for the dated digest; the `YYYY-MM-DD` token is replaced with the local date. Files are `<stem>.md` / `<stem>.html`; same-day reruns overwrite them. |
+| `digest_latest` | `~/.local/state/gitreport/digests/latest` | Extension-less stem refreshed (symlinked) to the newest digest on every run. |
+
+## State file
+
+The attention digest keeps its inbox in `~/.local/state/gitreport/state.json`
+(configurable via `attention.state_path`). All timestamps are stored in UTC.
+
+**What it stores:** one record per attention item — status (`open`, `acked`,
+`resolved`), origins and kinds, human-readable reasons, repo, title, URL,
+`first_seen` / `last_updated`, `acked_at`, `resolved_at`, `pinned`, and
+`reopen_count` — plus the report-level clocks: `last_reviewed` (the
+consumption cursor; only `gitreport read` advances it), `reviewed_at` (the
+wall-clock time of that read, used for the status line), and
+`last_digest_run`.
+
+**Corruption:** writes are atomic (temporary file + rename) and happen under
+an exclusive lock, so corruption is unlikely. If the file is ever unreadable,
+the next state-mutating command (`digest`, `read`) renames it
+to `state.json.corrupt-<timestamp>` and rebuilds an empty state, with a
+warning on stderr; read-only views (`attention`, `ack --list`) and item
+commands (`ack <ID>`, `unack`) treat the corrupt file as empty without
+renaming it or warning — item commands will simply report "No open item
+matches". **Ack/read history in the renamed file is lost**, though the backup
+remains on disk for manual inspection.
+
+**Retention:** an `acked` or `resolved` item is pruned 30 days after its
+sources stopped reporting it. While any source still reports an acked item,
+the record is kept as a *suppression record* so it never re-enters the inbox
+as New — a long-open assigned issue, for example, persists for as long as it
+stays acked.

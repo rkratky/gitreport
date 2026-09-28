@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+
 from gitreport.config import Config, load_config
 
 
@@ -70,4 +71,72 @@ def test_load_config_validation_error(tmp_path: Path):
         yaml.dump(config_content, f)
 
     with pytest.raises(ValueError, match="Configuration validation error"):
+        load_config(config_file)
+
+
+def test_attention_block_optional_with_defaults(tmp_path: Path):
+    """An existing config without `attention:` validates and gets defaults."""
+    config_content = {"providers": {"github": {"username": "u", "token": "t"}}}
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+    assert config.attention.stale_pr_days == 7
+    assert config.attention.digest_formats == ["html", "md"]
+    assert config.attention.exclusions == {}
+    assert str(config.attention.state_path).endswith("state.json")
+
+
+def test_attention_custom_values(tmp_path: Path):
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "exclusions": {"github": ["me/fork-*"]},
+            "stale_pr_days": 3,
+            "state_path": "~/tmp/state.json",
+            "digest_formats": ["html", "md"],
+            "digest_output": "~/tmp/digests/YYYY-MM-DD",
+            "digest_latest": "~/tmp/digests/latest",
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+    assert config.attention.stale_pr_days == 3
+    assert config.attention.exclusions == {"github": ["me/fork-*"]}
+    assert not str(config.attention.state_path).startswith("~")
+
+
+def test_relative_attention_paths_resolve_against_config_dir(tmp_path: Path):
+    """R9b: a still-relative attention path resolves against the config
+    file's parent (after expanduser), not the process CWD."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": "state/state.json",
+            "digest_output": "digests/YYYY-MM-DD",
+            "digest_latest": "digests/latest",
+        },
+    }
+    config_file = tmp_path / "sub" / "config.yaml"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+
+    assert config.attention.state_path == tmp_path / "sub" / "state" / "state.json"
+    assert config.attention.digest_output == tmp_path / "sub" / "digests" / "YYYY-MM-DD"
+    assert config.attention.digest_latest == tmp_path / "sub" / "digests" / "latest"
+
+
+def test_attention_md_format_required(tmp_path: Path):
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {"digest_formats": ["html"]},
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    with pytest.raises(ValueError, match="requires the .md. digest format"):
         load_config(config_file)

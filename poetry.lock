@@ -693,6 +693,22 @@ setuptools = "*"
 docs = ["Sphinx"]
 
 [[package]]
+name = "markdown"
+version = "3.11"
+description = "Python implementation of John Gruber's Markdown."
+optional = false
+python-versions = ">=3.11"
+groups = ["main"]
+files = [
+    {file = "markdown-3.11-py3-none-any.whl", hash = "sha256:cd6c89e7eb308c8b332ed673215a52d208a43f8bacc030b1419376129408719e"},
+    {file = "markdown-3.11.tar.gz", hash = "sha256:180224db6aed87ba9ce1f2781ebcd5826253de8ff637112090e24b84502bbf9f"},
+]
+
+[package.extras]
+docs = ["ghp-import (==2.1.0)", "justhtml (==3.11.2)", "mdx_gh_links (==0.4)", "mkdocstrings (==1.0.6)", "mkdocstrings-python (==1.16.8)", "pygments (==2.21.0)", "pymdown-extensions (==11.0.2)", "zensical (==0.0.62)"]
+testing = ["coverage", "pyyaml"]
+
+[[package]]
 name = "more-itertools"
 version = "11.1.0"
 description = "More routines for operating on iterables, beyond itertools"
@@ -1555,4 +1571,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "e83a0943f46f0a11bb39901788fbfb030c95f265af5f12f9b78f3de0e1ee2c73"
+content-hash = "687fd7084fb67e3a2ec328f5fd055d20601faabeb75b44751b981a403977e1e9"

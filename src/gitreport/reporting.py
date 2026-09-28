@@ -1,4 +1,10 @@
-from .providers.base import ACTIVITY_CATEGORIES, ActivityItem, RepoActivity, has_activity
+from .providers.base import (
+    ACTIVITY_CATEGORIES,
+    ActivityItem,
+    RepoActivity,
+    escape_user,
+    has_activity,
+)
 
 PROVIDER_LABELS = {
     "github": {
@@ -24,7 +30,10 @@ PROVIDER_DISPLAY_NAMES = {
 
 
 def _format_item(item: ActivityItem) -> str:
-    line = f"- [{item['title']}]({item['url']})"
+    # The title is user-supplied (PR/issue titles) and would otherwise go
+    # into Markdown raw — a title like "see [x](https://evil)" would render
+    # as a second link. The url field stays trusted.
+    line = f"- [{escape_user(item['title'])}]({item['url']})"
     if item.get("also_merged"):
         line += " → merged, too"
     return line

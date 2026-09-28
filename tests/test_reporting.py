@@ -103,7 +103,8 @@ def test_generate_report_merged_annotation():
         }
     }
     report = generate_report(provider_data)
-    assert "- [Reviewed+Merged](http://x/9) → merged, too" in report
+    # Titles are escape_user-guarded (XT-01): "+" is markdown-escaped.
+    assert "- [Reviewed\\+Merged](http://x/9) → merged, too" in report
     # It must not appear under a separate merged section.
     assert "PRs merged" not in report
 
@@ -127,3 +128,21 @@ def test_generate_report_empty_data():
     """Test report generation with empty input data."""
     report = generate_report({})
     assert report == "# Git activity report"
+
+
+def test_generate_report_escapes_hostile_title():
+    """A hostile title is escaped into literal text, not a second link (XT-01)."""
+    provider_data = {
+        "github": {
+            "repo": _repo(
+                "public",
+                prs_submitted=[{"title": "see [x](https://evil)", "url": "http://x/1"}],
+            )
+        }
+    }
+    report = generate_report(provider_data)
+    # Title renders as escaped text...
+    assert "\\[x\\]" in report
+    # ...and the line keeps exactly one link target (the trusted url).
+    item_line = next(line for line in report.splitlines() if "http://x/1" in line)
+    assert item_line.count("](") == 1

@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, ValidationError
+from pydantic import BaseModel, Field, SecretStr, ValidationError, model_validator
 
 # --- Pydantic Models for Configuration ---
 
@@ -22,10 +22,28 @@ class ProviderConfig(BaseModel):
     )
 
 
+class AttentionConfig(BaseModel):
+    """Configuration for the attention digest feature."""
+
+    exclusions: dict[str, list[str]] = Field(default_factory=dict)
+    stale_pr_days: int = 7
+    state_path: Path = Path("~/.local/state/gitreport/state.json")
+    digest_formats: list[str] = Field(default_factory=lambda: ["html", "md"])
+    digest_output: Path = Path("~/.local/state/gitreport/digests/YYYY-MM-DD")
+    digest_latest: Path = Path("~/.local/state/gitreport/digests/latest")
+
+    @model_validator(mode="after")
+    def _validate_formats(self) -> "AttentionConfig":
+        if "md" not in self.digest_formats:
+            raise ValueError("`gitreport read` requires the `md` digest format")
+        return self
+
+
 class Config(BaseModel):
     """Root model for the application's configuration."""
 
     providers: dict[str, ProviderConfig]
+    attention: AttentionConfig = Field(default_factory=AttentionConfig)
 
 
 # --- Configuration Loading ---
@@ -63,6 +81,16 @@ def load_config(config_path: Path | None = None) -> Config:
         raise ValueError("Configuration file is empty.")
 
     try:
-        return Config.model_validate(config_data)
+        config = Config.model_validate(config_data)
     except ValidationError as e:
         raise ValueError(f"Configuration validation error: {e}")
+    # R9b: a still-relative attention path is anchored at the config file's
+    # parent (expanduser first, so ~-paths stay absolute and win), never at
+    # whatever CWD the command happened to run from.
+    base = path.parent
+    for field in ("state_path", "digest_output", "digest_latest"):
+        value: Path = getattr(config.attention, field).expanduser()
+        if not value.is_absolute():
+            value = base / value
+        setattr(config.attention, field, value)
+    return config

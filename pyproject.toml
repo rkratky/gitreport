@@ -8,7 +8,8 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.11"
 click = "^8.1.7"
-pygithub = "^2.3.0"
+pygithub = "^2.6"
+markdown = "^3.6"
 launchpadlib = "^1.11.0"
 pyyaml = "^6.0.1"
 pydantic = "^2.7.1"
@@ -30,6 +31,7 @@ target-version = ['py311']
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+src = ["src"]
 select = ["E", "F", "I", "N", "W", "UP"]
 
 [build-system]
