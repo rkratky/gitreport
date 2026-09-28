@@ -4,6 +4,7 @@ from pathlib import Path
 
 from launchpadlib.launchpad import Launchpad
 
+from ..attention import _parse
 from .base import (
     AttentionFetch,
     AttentionItem,
@@ -69,21 +70,6 @@ def _same_person(entry, person) -> bool:
 
 def _in_range(when: datetime | None, start: datetime, end: datetime) -> bool:
     return when is not None and start <= when <= end
-
-
-def _parse_naive_utc(ts: str | None) -> datetime | None:
-    """ISO timestamp string -> aware datetime; naive values are read as UTC.
-
-    None and unparseable input return None rather than raising: one malformed
-    stored field must never abort the resolved-id pass.
-    """
-    if ts is None:
-        return None
-    try:
-        dt = datetime.fromisoformat(ts)
-    except (ValueError, TypeError):
-        return None
-    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
 
 
 def _aware_utc(dt: datetime | None) -> datetime | None:
@@ -363,7 +349,7 @@ class LaunchpadProvider:
             return AttentionFetch(
                 ok=True,
                 items=self._dedupe(items),
-                resolved_ids=self._proven_resolved(state_items),
+                resolved_ids=self._proven_resolved(state_items, person),
                 error=None,
             )
         except Exception as e:  # noqa: BLE001
@@ -484,17 +470,19 @@ class LaunchpadProvider:
             consider(getattr(comment, "date_created", None) if comment else None)
         return latest
 
-    def _proven_resolved(self, state_items: dict[str, dict] | None) -> list[str]:
+    def _proven_resolved(self, state_items: dict[str, dict] | None, person=None) -> list[str]:
         """Re-load open or acked LP items from state; report ids proven closed.
 
         Two proof paths (R5): a closing status on the live object, and — for
         open records only — the leave rule: the user commented/voted on the
         item after its recorded last_updated, so it no longer needs
         attention (spec: "user commented/voted after last_updated"). Every
-        probe failure is skipped, never treated as proof.
+        probe failure is skipped, never treated as proof. `person` is the
+        user entry already fetched by get_attention; when it is None the
+        leave rule is skipped (never re-fetched here) — a failed user fetch
+        must not turn the whole resolved pass stale.
         """
         resolved: list[str] = []
-        person = self._launchpad.me
         for mid, rec in (state_items or {}).items():
             if not mid.startswith("lp:") or rec.get("status") not in ("open", "acked"):
                 continue
@@ -506,6 +494,8 @@ class LaunchpadProvider:
             if status in CLOSED_BUG_STATUSES or status in self.MP_CLOSED_STATUSES:
                 resolved.append(mid)
                 continue
+            if person is None:
+                continue  # without the user, the leave rule cannot be evaluated
             if rec.get("status") != "open":
                 continue  # the leave rule applies to open records only
             try:
@@ -523,7 +513,7 @@ class LaunchpadProvider:
         object may be a bug task; `_bug_messages` walks to the underlying
         bug). Naive timestamps on either side are read as UTC.
         """
-        last_updated = _parse_naive_utc(rec.get("last_updated"))
+        last_updated = _parse(rec.get("last_updated"))
         if last_updated is None:
             return False
         responded: datetime | None = None

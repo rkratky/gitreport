@@ -643,6 +643,62 @@ def test_proven_resolved_leave_rule_not_applied_to_acked():
     assert fetch["resolved_ids"] == []
 
 
+def test_get_attention_me_failure_marks_not_ok():
+    """MINOR-1 guard: a failing `self._launchpad.me` access must fail the
+    whole fetch (existing behaviour), not silently degrade the pass."""
+    provider = _lp_provider()
+
+    class _MeBoom:
+        @property
+        def me(self):
+            raise RuntimeError("me down")
+
+    provider._launchpad = _MeBoom()
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["ok"] is False
+    assert "me down" in fetch["error"]
+
+
+def test_proven_resolved_person_none_closing_status_only():
+    """MINOR-1: with person=None (failed user fetch) the closing-status
+    checks still resolve items, but the user-authored leave rule is
+    skipped — re-reading `me` inside the resolved pass must not let one
+    transient failure mark the whole fetch stale."""
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    me.self_link = "https://api.launchpad.net/devel/~testuser"
+    closed_bug = _bug_mock("proj", status="Fix Released")
+    open_mp = _mp(
+        "https://launchpad.net/~u/+git/repo/+merge/15",
+        votes=[
+            MockVote(
+                reviewer=me,
+                registrant=me,
+                comment=MockComment(datetime(2026, 9, 29, tzinfo=UTC)),
+            )
+        ],
+    )
+    provider._launchpad.load.side_effect = lambda url: (
+        closed_bug if url.endswith("bugs/77") else open_mp
+    )
+    state_items = {
+        "lp:https://launchpad.net/bugs/77": {
+            "url": "https://launchpad.net/bugs/77",
+            "provider": "launchpad",
+            "status": "open",
+            "last_updated": "2026-09-26T00:00:00+00:00",
+        },
+        "lp:https://launchpad.net/~u/+git/repo/+merge/15": {
+            "url": "https://launchpad.net/~u/+git/repo/+merge/15",
+            "provider": "launchpad",
+            "status": "open",
+            "last_updated": "2026-09-26T00:00:00+00:00",
+        },
+    }
+    resolved = provider._proven_resolved(state_items, person=None)
+    assert resolved == ["lp:https://launchpad.net/bugs/77"]
+
+
 def test_naive_since_gets_utc():
     """BUG-05: a naive `since` is treated as UTC, not a TypeError."""
     provider = _lp_provider()
