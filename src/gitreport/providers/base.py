@@ -122,17 +122,25 @@ ATTENTION_KINDS = (
     "lp_mp_needs_review",
 )
 
-_MD_SPECIALS = "\\`*_{}[]()#+.!|>~"
+# Markdown metacharacters, backslash first so escaping is single-pass.
+# `-` and `=` are included so line-start block syntax (list items, setext
+# headings) cannot survive the whitespace collapse.
+_MD_SPECIALS = "\\`*_{}[]()#+.!=|>~-"
 
 
 def escape_user(text: str) -> str:
     """Escape user-supplied text for Markdown that will render as HTML.
 
-    Neutralises HTML special characters and backslash-escapes Markdown
+    Collapses all whitespace runs to single spaces (newlines and line-start
+    block syntax can then no longer introduce headings, lists or fences),
+    neutralises HTML special characters, and backslash-escapes Markdown
     metacharacters, so hostile titles cannot form links, images or emphasis.
+
+    Stored title/reason fields are Markdown-escaped; consumers must render
+    them as Markdown, not plain text.
     """
+    text = " ".join(text.split())
     text = _html.escape(text, quote=False)
-    text = text.replace("\\", "\\\\")
     for ch in _MD_SPECIALS:
         text = text.replace(ch, "\\" + ch)
     return text
