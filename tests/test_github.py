@@ -55,9 +55,9 @@ class MockReview:
 
 
 @patch("gitreport.providers.github.Github")
-def test_github_provider_get_activity(MockGithub):
+def test_github_provider_get_activity(mock_github_cls):
     """Test the get_activity method of the GitHubProvider."""
-    mock_github_instance = MockGithub.return_value
+    mock_github_instance = mock_github_cls.return_value
 
     provider = GitHubProvider(username="testuser", token="fake-token")
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
@@ -98,9 +98,9 @@ def test_github_provider_get_activity(MockGithub):
 
 
 @patch("gitreport.providers.github.Github")
-def test_github_fast_mode_skips_verification_and_merged(MockGithub):
+def test_github_fast_mode_skips_verification_and_merged(mock_github_cls):
     """In fast mode the reviewed PR is trusted from search and merged is skipped."""
-    mock_github_instance = MockGithub.return_value
+    mock_github_instance = mock_github_cls.return_value
     provider = GitHubProvider(username="testuser", token="fake-token")
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
     end_date = datetime(2024, 1, 31, tzinfo=UTC)
@@ -123,9 +123,9 @@ def test_github_fast_mode_skips_verification_and_merged(MockGithub):
 
 
 @patch("gitreport.providers.github.Github")
-def test_github_merged_not_reviewed_goes_to_merged_category(MockGithub):
+def test_github_merged_not_reviewed_goes_to_merged_category(mock_github_cls):
     """A PR merged by the user but not reviewed appears under prs_merged."""
-    mock_github_instance = MockGithub.return_value
+    mock_github_instance = mock_github_cls.return_value
     provider = GitHubProvider(username="testuser", token="fake-token")
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
     end_date = datetime(2024, 1, 31, tzinfo=UTC)
@@ -150,9 +150,9 @@ def test_github_merged_not_reviewed_goes_to_merged_category(MockGithub):
 
 
 @patch("gitreport.providers.github.Github")
-def test_github_merged_and_reviewed_annotates_reviewed(MockGithub):
+def test_github_merged_and_reviewed_annotates_reviewed(mock_github_cls):
     """A PR both reviewed and merged by the user is annotated, not duplicated."""
-    mock_github_instance = MockGithub.return_value
+    mock_github_instance = mock_github_cls.return_value
     provider = GitHubProvider(username="testuser", token="fake-token")
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
     end_date = datetime(2024, 1, 31, tzinfo=UTC)

@@ -111,13 +111,13 @@ def generate(config_path_str: Path | None, start_date: str, end_date: str, fast:
         for provider_name, provider_config in config.providers.items():
             if provider_name in PROVIDER_MAP:
                 try:
-                    ProviderClass = PROVIDER_MAP[provider_name]
+                    provider_cls = PROVIDER_MAP[provider_name]
                     token = (
                         provider_config.token.get_secret_value()
                         if provider_config.token is not None
                         else None
                     )
-                    provider = ProviderClass(
+                    provider = provider_cls(
                         username=provider_config.username,
                         token=token,
                     )

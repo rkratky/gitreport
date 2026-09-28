@@ -50,9 +50,9 @@ def _mp(web_link, repo="proj/repo", private=False, **kwargs):
 
 
 @patch("gitreport.providers.launchpad.Launchpad")
-def test_launchpad_bugs_and_submitted(MockLaunchpad):
+def test_launchpad_bugs_and_submitted(mock_launchpad_cls):
     """Bugs created/closed and submitted MPs are collected within range."""
-    mock_lp_instance = MockLaunchpad.login_with.return_value
+    mock_lp_instance = mock_launchpad_cls.login_with.return_value
     me = MockLaunchpadPerson(name="testuser")
     mock_lp_instance.me = me
     mock_lp_instance.bugs = MagicMock()
@@ -102,7 +102,7 @@ def test_launchpad_bugs_and_submitted(MockLaunchpad):
     assert len(activity["proj/two"]["issues_closed"]) == 1
     assert len(activity["proj/submitted"]["prs_submitted"]) == 1
 
-    MockLaunchpad.login_with.assert_called_with(
+    mock_launchpad_cls.login_with.assert_called_with(
         "gitreport-cli",
         "production",
         credentials_file=str(LP_CREDENTIALS_PATH),
@@ -111,9 +111,9 @@ def test_launchpad_bugs_and_submitted(MockLaunchpad):
 
 
 @patch("gitreport.providers.launchpad.Launchpad")
-def test_launchpad_reviews_requested_and_claimed_merged(MockLaunchpad):
+def test_launchpad_reviews_requested_and_claimed_merged(mock_launchpad_cls):
     """Both requested and self-claimed reviews land under prs_reviewed."""
-    mock_lp_instance = MockLaunchpad.login_with.return_value
+    mock_lp_instance = mock_launchpad_cls.login_with.return_value
     me = MockLaunchpadPerson(name="testuser")
     other = MockLaunchpadPerson(name="otheruser")
     mock_lp_instance.me = me
@@ -158,9 +158,9 @@ def test_launchpad_reviews_requested_and_claimed_merged(MockLaunchpad):
 
 
 @patch("gitreport.providers.launchpad.Launchpad")
-def test_launchpad_merged_by_user_not_authored(MockLaunchpad):
+def test_launchpad_merged_by_user_not_authored(mock_launchpad_cls):
     """MP merged by the user (not authored, not reviewed) -> prs_merged."""
-    mock_lp_instance = MockLaunchpad.login_with.return_value
+    mock_lp_instance = mock_launchpad_cls.login_with.return_value
     me = MockLaunchpadPerson(name="testuser")
     other = MockLaunchpadPerson(name="otheruser")
     mock_lp_instance.me = me
@@ -189,9 +189,9 @@ def test_launchpad_merged_by_user_not_authored(MockLaunchpad):
 
 
 @patch("gitreport.providers.launchpad.Launchpad")
-def test_launchpad_merged_and_reviewed_annotates(MockLaunchpad):
+def test_launchpad_merged_and_reviewed_annotates(mock_launchpad_cls):
     """MP both reviewed and merged by the user -> annotated, not duplicated."""
-    mock_lp_instance = MockLaunchpad.login_with.return_value
+    mock_lp_instance = mock_launchpad_cls.login_with.return_value
     me = MockLaunchpadPerson(name="testuser")
     other = MockLaunchpadPerson(name="otheruser")
     mock_lp_instance.me = me
