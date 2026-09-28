@@ -1,4 +1,10 @@
-"""Self-contained HTML digest rendering from the cached Markdown."""
+"""Self-contained HTML digest rendering from the cached Markdown.
+
+Known limitation: every raw ``<`` is rewritten to ``&lt;`` before conversion,
+so escaped-source digests cannot use Markdown autolinks (``<https://…>``) or
+code spans containing ``<`` or ``&`` — those render literally. Accepted: the
+digest format never emits those constructs.
+"""
 
 import html
 import re
@@ -31,14 +37,17 @@ a {{ color: #0645ad; }}
 _IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 # markdown always serialises attributes double-quoted. Only absolute http(s)
 # URLs may be linked: attention entries are guarded by attention.py's
-# _URL_UNSAFE + scheme check, but activity titles reach the body unescaped, so
-# this is a second line of defence, not the primary guard.
+# _URL_UNSAFE + scheme check, activity titles are escape_user-escaped in
+# reporting.py, so this is a second line of defence, not the primary guard.
 _UNSAFE_HREF_RE = re.compile(r'href="(?!(?:https?)://)[^"]*"', re.IGNORECASE)
+# markdown renders `[a](url "title")` with a title="..." attribute; the title
+# text is user-supplied and must never sit in an attribute value.
+_LINK_TITLE_ATTR_RE = re.compile(r'\s+title="[^"]*"')
 
 
 def strip_front_matter(md_text: str) -> tuple[dict, str]:
     """Split `---`-fenced front matter from the Markdown body."""
-    match = re.match(r"\A---\n(.*?)\n---\n", md_text, re.DOTALL)
+    match = re.match(r"\A---\r?\n(.*?)\r?\n?---\r?\n", md_text, re.DOTALL)
     if not match:
         return {}, md_text
     meta: dict = {}
@@ -51,7 +60,16 @@ def strip_front_matter(md_text: str) -> tuple[dict, str]:
 
 def replace_status_line(md_text: str, new_status: str) -> str:
     """Replace the single `Status:` sentinel line in the cached Markdown."""
-    return re.sub(r"^Status: .*$", new_status, md_text, count=1, flags=re.MULTILINE)
+    # A function replacement keeps new_status literal (backslashes in the
+    # status are data, not re.sub replacement escapes); [^\r\n]* stops before
+    # the CR of a CRLF terminator so line endings are preserved.
+    return re.sub(
+        r"^Status: [^\r\n]*",
+        lambda _m: new_status,
+        md_text,
+        count=1,
+        flags=re.MULTILINE,
+    )
 
 
 def render_html(md_text: str, title: str = "GitReport digest") -> str:
@@ -62,18 +80,20 @@ def render_html(md_text: str, title: str = "GitReport digest") -> str:
     verbatim):
 
     - Every raw ``<`` in the body is rewritten to ``&lt;`` before conversion.
-      Attention titles/reasons are escape_user-guarded upstream, but activity
-      titles are not, so raw HTML (script/svg onload/iframe/...) must never
-      reach the parser. Only ``<`` is rewritten: ``>`` stays intact so
-      blockquote syntax keeps working. Trade-off: a literal ``<`` inside a
-      code span would double-escape on display; the digest format emits no
-      such span (the only backticked text is the fixed `gitreport read`
-      sentinel).
+      Attention titles/reasons are escape_user-guarded upstream and activity
+      titles are escape_user-escaped in reporting.py, so raw HTML
+      (script/svg onload/iframe/...) must never reach the parser. Only ``<``
+      is rewritten: ``>`` stays intact so blockquote syntax keeps working.
+      Trade-off: a literal ``<`` inside a code span would double-escape on
+      display; the digest format emits no such span (the only backticked text
+      is the fixed `gitreport read` sentinel).
     - markdown-generated ``<img>`` tags are stripped: the digest must stay
       self-contained (no external references), and no digest section emits
       images intentionally.
     - ``href`` values that are not absolute http(s) URLs are replaced with
       ``#`` (e.g. the javascript: link in the hostile-title test).
+    - markdown-generated link ``title="..."`` attributes are stripped:
+      user-supplied link titles must never land in an attribute value.
     - The ``title`` argument is HTML-escaped before it enters the template.
     """
     _meta, body = strip_front_matter(md_text)
@@ -81,4 +101,5 @@ def render_html(md_text: str, title: str = "GitReport digest") -> str:
     rendered = markdown.markdown(safe_body, output_format="html")
     rendered = _IMG_TAG_RE.sub("", rendered)
     rendered = _UNSAFE_HREF_RE.sub('href="#"', rendered)
+    rendered = _LINK_TITLE_ATTR_RE.sub("", rendered)
     return _TEMPLATE.format(title=html.escape(title), body=rendered)

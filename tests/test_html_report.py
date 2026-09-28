@@ -71,3 +71,42 @@ def test_render_html_escapes_title():
     html = render_html(MD, title='<script>alert("x")</script>')
     assert "<script>alert" not in html
     assert "&lt;script&gt;" in html
+
+
+def test_render_html_strips_link_title_attribute():
+    # BUG-01: a user-supplied link title (`[a](url "title")`) lands in a
+    # title="..." attribute after markdown conversion — strip it so hostile
+    # text can never sit in an attribute value.
+    md = MD.replace("[T](https://github.com/o/r/pull/1)", '[a](https://ok "user text")')
+    html = render_html(md)
+    assert 'title="' not in html
+    assert "user text" not in html
+
+
+def test_replace_status_line_backslashes_round_trip():
+    # BUG-02: the new status is data — backslashes must be inserted literally,
+    # not interpreted as re.sub replacement escapes (`\p` raises, `\n`
+    # injects a newline).
+    new_status = r"Status: Reviewed \path\to\file"
+    out = replace_status_line(MD, new_status)
+    assert new_status in out
+    assert "NOT YET REVIEWED" not in out
+
+
+def test_replace_status_line_crlf_preserves_cr():
+    # BUG-02: `.` matched \r, so the CR terminator of the Status line was
+    # swallowed on CRLF files. The tightened pattern must stop before \r.
+    out = replace_status_line(MD.replace("\n", "\r\n"), "Status: Reviewed Mon 28")
+    lines = out.split("\n")
+    assert "Status: Reviewed Mon 28\r" in lines
+    assert "# GitReport digest\r" in lines  # other lines keep their CRs
+    assert "NOT YET REVIEWED" not in out
+
+
+def test_strip_front_matter_crlf():
+    # BUG-03: the fence pattern required bare \n; CRLF front matter was not
+    # recognised and meta parsing silently returned nothing.
+    meta, body = strip_front_matter(MD.replace("\n", "\r\n"))
+    assert meta["generated_at"] == "2026-09-28T06:00:00+00:00"
+    assert meta["coverage_start"] == "2026-09-27T06:00:00+00:00"
+    assert body.startswith("\r\n# GitReport digest")
