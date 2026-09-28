@@ -302,6 +302,20 @@ def test_render_digest_markdown_shape():
     assert "# Git activity report" in md
 
 
+def test_render_digest_markdown_bad_generated_at_no_raise():
+    # R2-01 regression: unparseable generated_at used to make build_report's
+    # clock fall back to datetime.min, which overflows when localised to a
+    # negative-offset timezone; the fallback must be a live "now" instead.
+    state = state_with(
+        last_reviewed="2026-09-29T00:00:00+00:00",
+        items={"gh:1": rec(first_seen=NOW, last_updated=NOW)},
+    )
+    md = render_digest_markdown(state, "x", "bad", "bad", [])
+    assert "## Needs attention" in md
+    assert "Still open" in md
+    assert "- [T](https://x/1)" in md
+
+
 def test_render_attention_stdout_is_dry_view():
     out = render_attention_stdout(
         state_with(), stale_providers=["launchpad"], now=datetime.fromisoformat(NOW)
@@ -431,6 +445,14 @@ def test_merge_and_report_survive_garbage_last_updated():
     report = build_report(new_state, datetime.fromisoformat(NOW))
     # unparseable last_updated buckets as "older"; record survives
     assert [e["id"] for e in report["older"]] == ["gh:bad"]
+    # R2-02: unparseable last_reviewed counts as never-reviewed (first-run
+    # semantics) — the open item is New.
+    assert (
+        build_report({**new_state, "last_reviewed": "GARBAGE-TS"}, datetime.fromisoformat(NOW))[
+            "new"
+        ][0]["id"]
+        == "gh:bad"
+    )
 
 
 def test_unparseable_first_seen_not_new():

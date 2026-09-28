@@ -182,8 +182,10 @@ def build_report(state: dict, now: datetime) -> dict:
         first_seen = r.get("first_seen") or ""
         fs = _parse(first_seen)
         lr = _parse(last_reviewed) if last_reviewed else None
-        # unparseable first_seen is treated as not-New (defensive: bad stored
-        # data must not promote an item into the New bucket).
+        # An unparseable last_reviewed counts as never-reviewed (same as
+        # unset, matching first-run semantics): every open item is New.
+        # Conversely, an unparseable first_seen is treated as not-New — bad
+        # stored data must not promote an item into the New bucket.
         is_new = lr is None or (fs is not None and fs > lr)
         entry = {
             "id": mid,
@@ -289,7 +291,10 @@ def render_digest_markdown(
         f"Coverage: {_fmt_local(coverage_start)} – {_fmt_local(generated_at)} "
         f"({days} {unit} since last review)"
     )
-    report = build_report(state, end_dt if end_dt is not None else _EPOCH)
+    # An unparseable generated_at is a programming error; degrade the report
+    # clock to a live "now" (datetime.min would overflow once localised to a
+    # negative-offset timezone).
+    report = build_report(state, end_dt if end_dt is not None else datetime.now(UTC))
     lines = [
         "---",
         f"generated_at: {generated_at}",
