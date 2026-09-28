@@ -10,6 +10,7 @@ class MockRepository:
     def __init__(self, name, private=False):
         self.full_name = name
         self.private = private
+        self.html_url = f"https://github.com/{name}"
 
 
 class MockUser:
@@ -191,12 +192,13 @@ class MockNotification:
         thread_url="https://api.github.com/notifications/threads/1",
         updated_at=None,
         subject_type="PullRequest",
+        repository: bool | None = True,  # None: the notification carries no repository
     ):
         self.reason = reason
         self.url = thread_url
         self.updated_at = updated_at or datetime(2026, 9, 28, tzinfo=UTC)
         self.subject = type("S", (), {"title": title, "url": subject_url, "type": subject_type})()
-        self.repository = MockRepository(repo)
+        self.repository = MockRepository(repo) if repository else repository
 
 
 class MockCheckRun:
@@ -339,8 +341,22 @@ def test_github_notification_and_graphql_share_id():
     assert thread_fetch["items"][0]["id"] == notification_id
 
 
-def test_github_notification_release_subject_falls_back_to_thread_url():
-    """Non PR/Issue subjects (releases, ...) render the thread url as display url."""
+def test_github_commit_subject_gets_commit_html_url():
+    """Commit subjects are rewritten to the html commit url (like PR/Issue)."""
+    notification = MockNotification(
+        "mention",
+        repo="o/r",
+        subject_url="https://api.github.com/repos/o/r/commits/abc123",
+        subject_type="Commit",
+    )
+    provider = _provider_with_notifications([notification])
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["items"][0]["url"] == "https://github.com/o/r/commit/abc123"
+
+
+def test_github_release_subject_shows_repo_html_url():
+    """Non-rewritable subjects (releases, ...) display the repository page;
+    the thread url stays only in the thread_url field."""
     notification = MockNotification(
         "comment",
         subject_url="https://api.github.com/repos/org/repo/releases/99",
@@ -349,7 +365,20 @@ def test_github_notification_release_subject_falls_back_to_thread_url():
     )
     provider = _provider_with_notifications([notification])
     fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
-    assert fetch["items"][0]["url"] == "https://api.github.com/notifications/threads/1"
+    assert fetch["items"][0]["url"] == "https://github.com/org/repo"
+    assert fetch["items"][0]["thread_url"] == "https://api.github.com/notifications/threads/1"
+
+
+def test_github_notification_repo_from_subject_url_when_repository_none():
+    """Without a repository object the repo is parsed from the subject url."""
+    notification = MockNotification(
+        "mention",
+        repository=None,
+        subject_url="https://api.github.com/repos/org/repo/pulls/1",
+    )
+    provider = _provider_with_notifications([notification])
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["items"][0]["repo"] == "org/repo"
 
 
 def test_github_query_items_kinds():
@@ -431,6 +460,7 @@ def test_github_thread_unresolved_via_graphql():
 
     assert fetch["ok"] is True
     assert [i["kind"] for i in fetch["items"]] == ["thread_unresolved"]
+    assert fetch["items"][0]["repo"] == "o/r"  # parsed from the html url
     assert fetch["items"][0]["id"] == "gh:https://github.com/o/r/pull/5"
 
 
@@ -466,6 +496,105 @@ def test_github_truncated_review_threads_skip_item(capsys):
     assert fetch["ok"] is True
     assert fetch["items"] == []  # truncated threads: item dropped
     assert "more than 100 review threads" in capsys.readouterr().err
+
+
+def test_github_excluded_repo_truncation_does_not_warn(capsys):
+    """Excluded repos are dropped before the truncation check: no warning."""
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = []
+        instance.search_issues.return_value = []
+        truncated = {
+            "data": {
+                "search": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "url": "https://github.com/me/excluded/pull/7",
+                            "title": "Excluded with too many threads",
+                            "updatedAt": "2026-09-27T10:00:00Z",
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": True},
+                                "nodes": [{"isResolved": False}],
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+        instance.requester.graphql_query.return_value = (truncated, ())
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(
+            datetime(2026, 9, 28, tzinfo=UTC), exclusions=["me/excluded"]
+        )
+
+    assert fetch["ok"] is True
+    assert fetch["items"] == []  # excluded repo: dropped silently
+    assert "more than 100 review threads" not in capsys.readouterr().err
+
+
+def test_github_null_review_threads_does_not_crash():
+    """An explicit null reviewThreads value must not crash the fetch."""
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = []
+        instance.search_issues.return_value = []
+        payload = {
+            "data": {
+                "search": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "url": "https://github.com/o/r/pull/8",
+                            "title": "Null threads",
+                            "updatedAt": "2026-09-27T10:00:00Z",
+                            "reviewThreads": None,
+                        }
+                    ],
+                }
+            }
+        }
+        instance.requester.graphql_query.return_value = (payload, ())
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+
+    assert fetch["ok"] is True
+    assert fetch["items"] == []
+
+
+def test_github_null_page_info_does_not_crash():
+    """An explicit null pageInfo value must not crash the fetch."""
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = []
+        instance.search_issues.return_value = []
+        payload = {
+            "data": {
+                "search": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "url": "https://github.com/o/r/pull/8",
+                            "title": "Null pageInfo",
+                            "updatedAt": "2026-09-27T10:00:00Z",
+                            "reviewThreads": {
+                                "pageInfo": None,
+                                "nodes": [{"isResolved": False}],
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+        instance.requester.graphql_query.return_value = (payload, ())
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+
+    assert fetch["ok"] is True
+    assert [i["kind"] for i in fetch["items"]] == ["thread_unresolved"]
 
 
 def test_github_thread_pagination_uses_end_cursor():

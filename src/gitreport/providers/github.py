@@ -216,7 +216,7 @@ class GitHubProvider:
                 if kind is None:
                     continue  # subscribed, state_change, manual, etc.
             title = getattr(n.subject, "title", "") or ""
-            if subject_type in ("PullRequest", "Issue") and subject_url:
+            if subject_type in ("PullRequest", "Issue", "Commit") and subject_url:
                 # Convert the subject API url to its html url for display:
                 # api.github.com/repos/o/r/pulls/3 -> github.com/o/r/pull/3
                 # api.github.com/repos/o/r/commits/<sha> -> github.com/o/r/commit/<sha>
@@ -227,8 +227,11 @@ class GitHubProvider:
                 )
             else:
                 # Other subject types (releases, discussions, ...) have no
-                # predictable api->html rewrite; show the thread url instead.
-                html_url = thread_url
+                # predictable api->html rewrite; display the repository page
+                # (the thread url stays only in the thread_url field).
+                html_url = getattr(repository, "html_url", None) or (
+                    f"https://github.com/{full_name}" if full_name else ""
+                )
             items.append(
                 self._item(
                     # Ids use the html url form so query/GraphQL-origin items
@@ -295,8 +298,20 @@ class GitHubProvider:
             )
             search = payload["data"]["search"]
             for node in search["nodes"]:
-                thread_data = node.get("reviewThreads", {})
-                if thread_data.get("pageInfo", {}).get("hasNextPage"):
+                # html url form github.com/<owner>/<repo>/pull/<n>: the repo
+                # full name is the first two segments after github.com/.
+                repo_full = (
+                    "/".join(node["url"].split("/github.com/")[1].split("/")[:2])
+                    if "/github.com/" in node["url"]
+                    else ""
+                )
+                if is_excluded(repo_full, exclusions):
+                    continue
+                # GraphQL fields can be explicitly null (key present, value
+                # None), so `or {}` guards are required — `.get(key, {})`
+                # would pass the null straight through.
+                thread_data = node.get("reviewThreads") or {}
+                if (thread_data.get("pageInfo") or {}).get("hasNextPage"):
                     # Truncated threads: item dropped rather than risk false
                     # resolution (we cannot see threads beyond the first 100).
                     print(
@@ -305,15 +320,8 @@ class GitHubProvider:
                         file=sys.stderr,
                     )
                     continue
-                threads = thread_data.get("nodes", [])
+                threads = thread_data.get("nodes") or []
                 if not any(not t.get("isResolved") for t in threads):
-                    continue
-                repo_full = (
-                    node["url"].split("/github.com/")[1].rsplit("/", 1)[0]
-                    if "/github.com/" in node["url"]
-                    else ""
-                )
-                if is_excluded(repo_full, exclusions):
                     continue
                 unresolved = sum(1 for t in threads if not t.get("isResolved"))
                 items.append(
