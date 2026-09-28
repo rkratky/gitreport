@@ -9,6 +9,11 @@ MAX_REASONS = 10
 BUCKETS = ("today", "week", "older")
 BUCKET_TITLES = {"today": "Today", "week": "Last 7 days", "older": "Older than 7 days"}
 
+# Launchpad kinds whose queries are time-windowed by `since`: falling out of
+# the window is normal ageing, not a leave path, so these records are never
+# resolved by absence — only via proven resolved_ids.
+WINDOWED_KINDS = frozenset({"lp_bug_activity", "lp_mp_comment"})
+
 # A URL is rendered as a Markdown link only when it is http(s) and free of
 # characters that would break the [title](url) syntax or smuggle markup.
 _URL_UNSAFE = re.compile(r"[\s()<>]")
@@ -151,6 +156,10 @@ def merge_into_state(
         if r.get("pinned") or mid in merged_items:
             continue  # still reported, or pinned: never auto-resolve
         if r.get("provider") in ok_providers or mid in resolved_ids:
+            kinds = set(r.get("kinds") or [])
+            windowed_only = bool(kinds) and kinds <= WINDOWED_KINDS
+            if windowed_only and mid not in resolved_ids:
+                continue  # windowed LP kinds: absence is not a leave path
             if r["status"] == "open":
                 r["status"] = "resolved"
                 r["resolved_at"] = generated_at

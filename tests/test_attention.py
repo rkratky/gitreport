@@ -219,6 +219,19 @@ def test_no_resolution_when_provider_fetch_failed():
     assert new_state["items"]["gh:1"]["status"] == "open"  # carried over
 
 
+def test_windowed_lp_kinds_not_resolved_by_absence():
+    """BUG-03: LP windowed kinds never resolve by absence — only via resolved_ids."""
+    state = state_with(
+        items={"lp:1": rec(provider="launchpad", kinds=["lp_bug_activity"], origins=["query"])}
+    )
+    new_state = merge_into_state(state, {}, {"launchpad"}, "2026-09-28T07:00:00+00:00")
+    assert new_state["items"]["lp:1"]["status"] == "open"  # absence is not a leave path
+    resolved = merge_into_state(
+        state, {}, {"launchpad"}, "2026-09-28T07:00:00+00:00", resolved_ids={"lp:1"}
+    )
+    assert resolved["items"]["lp:1"]["status"] == "resolved"  # proven resolution still works
+
+
 def test_resolved_id_override():
     state = state_with(items={"lp:1": rec(provider="launchpad")})
     new_state = merge_into_state(

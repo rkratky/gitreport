@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from launchpadlib.launchpad import Launchpad
@@ -69,6 +69,25 @@ def _same_person(entry, person) -> bool:
 
 def _in_range(when: datetime | None, start: datetime, end: datetime) -> bool:
     return when is not None and start <= when <= end
+
+
+def _api_url(web_url: str) -> str:
+    """
+    Map a Launchpad web URL to its API URL.
+
+    launchpadlib's load() accepts any URL, but web URLs return HTML, not
+    JSON — the parse fails and every load() silently resolves to nothing.
+    Rewriting the host to api.launchpad.net/devel makes load() work.
+    """
+    for prefix in (
+        "https://api.launchpad.net/",
+        "https://bugs.launchpad.net/",
+        "https://code.launchpad.net/",
+        "https://launchpad.net/",
+    ):
+        if web_url.startswith(prefix):
+            return "https://api.launchpad.net/devel/" + web_url[len(prefix) :]
+    return web_url
 
 
 class LaunchpadProvider:
@@ -270,6 +289,8 @@ class LaunchpadProvider:
     ) -> AttentionFetch:
         """Fetch Launchpad attention items (person-scoped queries)."""
         try:
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=UTC)
             person = self._launchpad.me
             items: list[AttentionItem] = []
 
@@ -318,10 +339,30 @@ class LaunchpadProvider:
                 )
 
             return AttentionFetch(
-                ok=True, items=items, resolved_ids=self._proven_resolved(state_items), error=None
+                ok=True,
+                items=self._dedupe(items),
+                resolved_ids=self._proven_resolved(state_items),
+                error=None,
             )
         except Exception as e:  # noqa: BLE001
             return AttentionFetch(ok=False, items=[], resolved_ids=[], error=str(e))
+
+    @staticmethod
+    def _dedupe(items: list[AttentionItem]) -> list[AttentionItem]:
+        """Drop duplicate ids, merging reasons (a bug can be assigned AND subscribed)."""
+        merged: dict[str, AttentionItem] = {}
+        for item in items:
+            if item["id"] in merged:
+                first = merged[item["id"]]
+                if item["reason"] not in first["reason"]:
+                    first["reason"] += "; " + item["reason"]
+                    if item.get("updated_at") and item["updated_at"] > (
+                        first.get("updated_at") or ""
+                    ):
+                        first["updated_at"] = item["updated_at"]
+            else:
+                merged[item["id"]] = item
+        return list(merged.values())
 
     def _mp_item(self, mp, repo_name, kind, reason, updated_at) -> AttentionItem:
         return AttentionItem(
@@ -358,13 +399,26 @@ class LaunchpadProvider:
     def _latest_foreign_event(self, mp, person, since) -> datetime | None:
         """Latest comment/vote on `mp` after `since` by someone other than me."""
         latest: datetime | None = None
+
+        def consider(when: datetime | None) -> None:
+            nonlocal latest
+            if when and when > since and (latest is None or when > latest):
+                latest = when
+
+        # Plain comments (author-annotated).
+        for comment in getattr(mp, "all_comments", []) or []:
+            if _same_person(getattr(comment, "author", None), person):
+                continue
+            consider(getattr(comment, "date_created", None))
+        # Vote comments (reviewer-annotated; the comment's own author is the
+        # reviewer, so both must be someone other than the user).
         for vote in mp.votes:
             if _same_person(vote.reviewer, person):
                 continue
             comment = getattr(vote, "comment", None)
-            when = getattr(comment, "date_created", None) if comment else None
-            if when and when > since and (latest is None or when > latest):
-                latest = when
+            if comment is not None and _same_person(getattr(comment, "author", None), person):
+                continue
+            consider(getattr(comment, "date_created", None) if comment else None)
         return latest
 
     def _proven_resolved(self, state_items: dict[str, dict] | None) -> list[str]:
@@ -374,7 +428,7 @@ class LaunchpadProvider:
             if not mid.startswith("lp:") or rec.get("status") != "open":
                 continue
             try:
-                obj = self._launchpad.load(rec["url"])
+                obj = self._launchpad.load(_api_url(rec["url"]))
             except Exception:
                 continue  # load failure is not proof
             status = getattr(obj, "status", None) or getattr(obj, "queue_status", None)

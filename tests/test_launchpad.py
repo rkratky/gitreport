@@ -322,3 +322,110 @@ def test_lp_fetch_failure_marks_not_ok():
     fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
     assert fetch["ok"] is False
     assert "lp down" in fetch["error"]
+
+
+# --- Fix round 1 regression tests ---
+
+
+def test_proven_resolved_uses_api_url():
+    """BUG-01: web URLs must be mapped to API URLs before launchpadlib load()."""
+    provider = _lp_provider()
+    provider._launchpad.load.return_value = _bug_mock("proj", status="Fix Released")
+    state_items = {
+        "lp:https://launchpad.net/bugs/77": {
+            "url": "https://launchpad.net/bugs/77",
+            "provider": "launchpad",
+            "status": "open",
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    called_url = provider._launchpad.load.call_args[0][0]
+    assert called_url.startswith("https://api.launchpad.net/devel/")
+    assert "lp:https://launchpad.net/bugs/77" in fetch["resolved_ids"]
+
+
+def test_latest_foreign_event_walks_all_comments():
+    """BUG-02a: a plain comment (all_comments) by someone else after since -> item."""
+    provider = _lp_provider()
+    comment = MockComment(datetime(2026, 9, 28, tzinfo=UTC))
+    other = MockLaunchpadPerson(name="otheruser")
+    mp = _mp(
+        "https://launchpad.net/~u/+git/repo/+merge/9",
+        votes=[],
+        all_comments=[MockLaunchpadObject(author=other, date_created=comment.date_created)],
+    )
+    provider._launchpad.me.getMergeProposals.return_value = [mp]
+    fetch = provider.get_attention(datetime(2026, 9, 27, tzinfo=UTC))
+    kinds = [i["kind"] for i in fetch["items"]]
+    assert "lp_mp_comment" in kinds
+
+
+def test_latest_foreign_event_own_comment_no_item():
+    """BUG-02b: the user's own all_comments entry must not produce an item."""
+    provider = _lp_provider()
+    me = provider._launchpad.me
+    mp = _mp(
+        "https://launchpad.net/~u/+git/repo/+merge/9",
+        votes=[],
+        all_comments=[
+            MockLaunchpadObject(author=me, date_created=datetime(2026, 9, 28, tzinfo=UTC))
+        ],
+    )
+    provider._launchpad.me.getMergeProposals.return_value = [mp]
+    fetch = provider.get_attention(datetime(2026, 9, 27, tzinfo=UTC))
+    assert [i for i in fetch["items"] if i["kind"] == "lp_mp_comment"] == []
+
+
+def test_getRequestedReviews_called_without_kwargs():  # noqa: N802
+    """BUG-04: getRequestedReviews uses default status (todo list semantics)."""
+    provider = _lp_provider()
+    provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    provider._launchpad.me.getRequestedReviews.assert_called_once_with()
+
+
+def test_searchTasks_constraint_calls():  # noqa: N802
+    """BUG-04: searchTasks assignee= has no modified_since; subscriber call carries it."""
+    provider = _lp_provider()
+    since = datetime(2026, 9, 28, tzinfo=UTC)
+    provider.get_attention(since)
+    calls = provider._launchpad.bugs.searchTasks.call_args_list
+    assert all("modified_since" not in c.kwargs for c in calls if "assignee" in c.kwargs)
+    assert any("modified_since" in c.kwargs for c in calls if "bug_subscriber" in c.kwargs)
+
+
+def test_load_failure_is_not_proof():
+    """BUG-04: load() raising leaves resolved_ids empty even for acked/open records."""
+    provider = _lp_provider()
+    provider._launchpad.load.side_effect = RuntimeError("api down")
+    state_items = {
+        "lp:https://launchpad.net/bugs/77": {
+            "url": "https://launchpad.net/bugs/77",
+            "provider": "launchpad",
+            "status": "open",
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert fetch["resolved_ids"] == []
+
+
+def test_naive_since_gets_utc():
+    """BUG-05: a naive `since` is treated as UTC, not a TypeError."""
+    provider = _lp_provider()
+    # datetime.min.isoformat has no tz; without the guard, comparison with
+    # tz-aware datetimes raises TypeError and ok becomes False.
+    fetch = provider.get_attention(datetime(2026, 9, 28))
+    assert fetch["ok"] is True
+
+
+def test_dedupe_bug_assigned_and_subscribed():
+    """BUG-06: a bug both assigned and subscribed produces ONE item with both reasons."""
+    provider = _lp_provider()
+    bug = _bug_mock("proj")
+    provider._launchpad.bugs.searchTasks.side_effect = _bug_search_side_effect(
+        assigned=[bug], subscribed=[bug]
+    )
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    bug_items = [i for i in fetch["items"] if i["id"] == "lp:https://launchpad.net/bugs/77"]
+    assert len(bug_items) == 1
+    assert "assigned to you" in bug_items[0]["reason"]
+    assert "new activity on subscribed bug" in bug_items[0]["reason"]
