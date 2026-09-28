@@ -408,13 +408,58 @@ def test_load_failure_is_not_proof():
     assert fetch["resolved_ids"] == []
 
 
+def test_proven_resolved_includes_acked_records():
+    """N-01: acked windowed records are re-loaded; a proven-closed bug resolves them."""
+    provider = _lp_provider()
+    provider._launchpad.load.return_value = _bug_mock("proj", status="Fix Released")
+    state_items = {
+        "lp:https://launchpad.net/bugs/88": {
+            "url": "https://launchpad.net/bugs/88",
+            "provider": "launchpad",
+            "status": "acked",
+            "kinds": ["lp_bug_activity"],
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert "lp:https://launchpad.net/bugs/88" in fetch["resolved_ids"]
+
+
+def test_load_failure_not_proof_for_acked():
+    """BUG-04 remainder: load() raising on an acked record leaves resolved_ids empty."""
+    provider = _lp_provider()
+    provider._launchpad.load.side_effect = RuntimeError("api down")
+    state_items = {
+        "lp:https://launchpad.net/bugs/88": {
+            "url": "https://launchpad.net/bugs/88",
+            "provider": "launchpad",
+            "status": "acked",
+            "kinds": ["lp_bug_activity"],
+        }
+    }
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), state_items=state_items)
+    assert fetch["resolved_ids"] == []
+
+
 def test_naive_since_gets_utc():
     """BUG-05: a naive `since` is treated as UTC, not a TypeError."""
     provider = _lp_provider()
     # datetime.min.isoformat has no tz; without the guard, comparison with
-    # tz-aware datetimes raises TypeError and ok becomes False.
-    fetch = provider.get_attention(datetime(2026, 9, 28))
+    # tz-aware datetimes raises TypeError and ok becomes False. A foreign
+    # comment after the naive since (interpreted as UTC) must produce an
+    # item — proving the window comparison actually ran.
+    other = MockLaunchpadPerson(name="otheruser")
+    mp = _mp(
+        "https://launchpad.net/~u/+git/repo/+merge/5",
+        votes=[],
+        all_comments=[
+            MockLaunchpadObject(author=other, date_created=datetime(2026, 9, 28, 12, 0, tzinfo=UTC))
+        ],
+    )
+    provider._launchpad.me.getMergeProposals.return_value = [mp]
+    fetch = provider.get_attention(datetime(2026, 9, 28))  # naive midnight
     assert fetch["ok"] is True
+    kinds = [i["kind"] for i in fetch["items"]]
+    assert "lp_mp_comment" in kinds
 
 
 def test_dedupe_bug_assigned_and_subscribed():

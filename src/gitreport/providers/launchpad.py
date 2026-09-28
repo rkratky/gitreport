@@ -422,10 +422,10 @@ class LaunchpadProvider:
         return latest
 
     def _proven_resolved(self, state_items: dict[str, dict] | None) -> list[str]:
-        """Re-load open LP items from state; report ids proven closed."""
+        """Re-load open or acked LP items from state; report ids proven closed."""
         resolved: list[str] = []
         for mid, rec in (state_items or {}).items():
-            if not mid.startswith("lp:") or rec.get("status") != "open":
+            if not mid.startswith("lp:") or rec.get("status") not in ("open", "acked"):
                 continue
             try:
                 obj = self._launchpad.load(_api_url(rec["url"]))

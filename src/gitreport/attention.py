@@ -12,6 +12,9 @@ BUCKET_TITLES = {"today": "Today", "week": "Last 7 days", "older": "Older than 7
 # Launchpad kinds whose queries are time-windowed by `since`: falling out of
 # the window is normal ageing, not a leave path, so these records are never
 # resolved by absence — only via proven resolved_ids.
+# Open windowed-only LP records persist by design: quiet subscribed-bug/
+# MP-comment items stay in the inbox until acked or proven closed (spec:
+# falling out of a modified_since window is not a leave path).
 WINDOWED_KINDS = frozenset({"lp_bug_activity", "lp_mp_comment"})
 
 # A URL is rendered as a Markdown link only when it is http(s) and free of
