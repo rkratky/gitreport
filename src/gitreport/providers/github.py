@@ -1,8 +1,38 @@
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from github import Auth, Github, GithubRetry
 
-from .base import RepoActivity, empty_repo_activity
+from .base import (
+    AttentionFetch,
+    AttentionItem,
+    RepoActivity,
+    empty_repo_activity,
+    escape_user,
+    is_excluded,
+)
+
+# Notification reasons that map to attention kinds. Reasons absent from this
+# map (subscribed, state_change, manual, ...) are skipped.
+GH_REASON_KIND = {
+    "review_requested": "review_requested",
+    "mention": "mention",
+    "team_mention": "mention",
+    "comment": "comment",
+    "author": "comment",
+    "assign": "issue_assigned",
+}
+
+REVIEW_THREADS_QUERY = """
+query($q: String!, $cursor: String) {
+  search(query: $q, type: ISSUE, first: 50, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest {
+      url title updatedAt
+      reviewThreads(first: 100) { nodes { isResolved } }
+    } }
+  }
+}
+"""
 
 
 class GitHubProvider:
@@ -129,3 +159,191 @@ class GitHubProvider:
             )
 
         return repos
+
+    def _item(
+        self,
+        *,
+        mid,
+        provider,
+        kind,
+        origin,
+        repo,
+        title,
+        url,
+        reason,
+        updated_at,
+        thread_url=None,
+    ) -> AttentionItem:
+        return AttentionItem(
+            id=mid,
+            provider=provider,
+            kind=kind,
+            origin=origin,
+            repo=repo,
+            title=escape_user(title),
+            url=url,
+            reason=escape_user(reason),
+            updated_at=updated_at,
+            thread_url=thread_url,
+        )
+
+    def _notification_items(self, exclusions) -> list[AttentionItem]:
+        items: list[AttentionItem] = []
+        for n in self._github.get_user().get_notifications(all=False):
+            subject_url = getattr(n.subject, "url", "") or ""
+            thread_url = getattr(n, "url", "") or ""
+            # Derive repo full name from the subject API url:
+            # https://api.github.com/repos/OWNER/REPO/pulls/3
+            parts = subject_url.split("/repos/")
+            full_name = (
+                parts[1].rsplit("/", 1)[0]
+                if len(parts) == 2
+                else (n.repository.full_name if n.repository else "")
+            )
+            if is_excluded(full_name, exclusions):
+                continue
+            reason = n.reason
+            if reason == "ci_activity":
+                if not self._ci_failed(full_name, subject_url):
+                    continue
+                kind = "ci_failure"
+            else:
+                kind = GH_REASON_KIND.get(reason)
+                if kind is None:
+                    continue  # subscribed, state_change, manual, etc.
+            title = getattr(n.subject, "title", "") or ""
+            # Convert the subject API url to its html url for display:
+            # api.github.com/repos/o/r/pulls/3 -> github.com/o/r/pull/3
+            html_url = (
+                subject_url.replace("api.github.com/repos/", "github.com/")
+                .replace("/pulls/", "/pull/")
+                .replace("/issues/", "/issues/")
+                if subject_url
+                else ""
+            )
+            items.append(
+                self._item(
+                    mid=f"gh:{subject_url or thread_url}",
+                    provider="github",
+                    kind=kind,
+                    origin="notification",
+                    repo=full_name,
+                    title=title,
+                    url=html_url,
+                    reason=reason,
+                    updated_at=n.updated_at.isoformat() if n.updated_at else None,
+                    thread_url=thread_url,
+                )
+            )
+        return items
+
+    def _ci_failed(self, full_name: str, subject_url: str) -> bool:
+        """True when the subject's check runs contain a failure."""
+        try:
+            number = int(subject_url.rsplit("/", 1)[1])
+            repo = self._github.get_repo(full_name)
+            pr = repo.get_pull(number)
+            # PyGithub has no PullRequest.get_check_runs; a PR's checks are the
+            # check runs on its head commit (same data the PR UI shows).
+            checks = repo.get_commit(pr.head.sha).get_check_runs()
+            return any(c.conclusion == "failure" for c in checks)
+        except Exception:
+            return False  # cannot verify -> skip, never fabricate a failure
+
+    def _search_item(self, issue, kind: str, reason: str, exclusions) -> AttentionItem | None:
+        repo_full = issue.repository.full_name
+        if is_excluded(repo_full, exclusions):
+            return None
+        updated = getattr(issue, "updated_at", None)
+        return self._item(
+            mid=f"gh:{issue.html_url}",
+            provider="github",
+            kind=kind,
+            origin="query",
+            repo=repo_full,
+            title=issue.title,
+            url=issue.html_url,
+            reason=reason,
+            updated_at=updated.isoformat() if updated else None,
+        )
+
+    def _unresolved_thread_items(self, exclusions) -> list[AttentionItem]:
+        items: list[AttentionItem] = []
+        cursor = None
+        while True:
+            variables = {"q": f"is:pr is:open author:{self._username}"}
+            if cursor:
+                variables["cursor"] = cursor
+            payload, _headers = self._github.requester.graphql_query(
+                REVIEW_THREADS_QUERY, variables
+            )
+            search = payload["data"]["search"]
+            for node in search["nodes"]:
+                threads = node.get("reviewThreads", {}).get("nodes", [])
+                if not any(not t.get("isResolved") for t in threads):
+                    continue
+                repo_full = (
+                    node["url"].split("/github.com/")[1].rsplit("/", 1)[0]
+                    if "/github.com/" in node["url"]
+                    else ""
+                )
+                if is_excluded(repo_full, exclusions):
+                    continue
+                unresolved = sum(1 for t in threads if not t.get("isResolved"))
+                items.append(
+                    self._item(
+                        mid=f"gh:{node['url']}",
+                        provider="github",
+                        kind="thread_unresolved",
+                        origin="query",
+                        repo=repo_full,
+                        title=node.get("title", ""),
+                        url=node["url"],
+                        reason=f"{unresolved} unresolved review thread(s)",
+                        updated_at=node.get("updatedAt"),
+                    )
+                )
+            page = search["pageInfo"]
+            if not page.get("hasNextPage"):
+                break
+            cursor = page.get("endCursor")
+        return items
+
+    def get_attention(
+        self,
+        since: datetime,
+        exclusions: list[str] | None = None,
+        state_items: dict[str, dict] | None = None,
+        stale_pr_days: int | None = None,
+    ) -> AttentionFetch:
+        """Fetch GitHub attention items (notifications + queries)."""
+        try:
+            items: list[AttentionItem] = []
+            items.extend(self._notification_items(exclusions))
+
+            date_q = f"is:pr is:open author:{self._username} status:failure"
+            for issue in self._github.search_issues(date_q):
+                got = self._search_item(issue, "ci_failure", "check failure", exclusions)
+                if got:
+                    items.append(got)
+
+            issue_q = f"is:issue is:open assignee:{self._username}"
+            for issue in self._github.search_issues(issue_q):
+                got = self._search_item(issue, "issue_assigned", "assigned to you", exclusions)
+                if got:
+                    items.append(got)
+
+            if stale_pr_days is not None:
+                cutoff = (datetime.now(UTC) - timedelta(days=stale_pr_days)).strftime("%Y-%m-%d")
+                stale_q = f"is:pr is:open author:{self._username} updated:<{cutoff}"
+                for issue in self._github.search_issues(stale_q):
+                    got = self._search_item(
+                        issue, "stale_pr", f"no activity for {stale_pr_days}+ days", exclusions
+                    )
+                    if got:
+                        items.append(got)
+
+            items.extend(self._unresolved_thread_items(exclusions))
+            return AttentionFetch(ok=True, items=items, resolved_ids=[], error=None)
+        except Exception as e:  # noqa: BLE001 — failure must degrade, not crash
+            return AttentionFetch(ok=False, items=[], resolved_ids=[], error=str(e))
