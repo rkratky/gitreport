@@ -1,9 +1,10 @@
-from datetime import UTC, datetime
+from datetime import datetime
 
 from gitreport.attention import (
     build_report,
     dedupe,
     merge_into_state,
+    render_attention_body,
     render_attention_stdout,
     render_digest_markdown,
 )
@@ -70,6 +71,16 @@ def state_with(**kwargs):
     }
     base.update(kwargs)
     return base
+
+
+def merged_with(*items):
+    """Wrap provider items into the merged_items mapping merge_into_state expects."""
+    return {
+        it["id"]: dedupe(
+            {"github": {"ok": True, "error": None, "resolved_ids": [], "items": [it]}}
+        )[it["id"]]
+        for it in items
+    }
 
 
 def test_dedupe_unions_origins_kinds_reasons():
@@ -172,6 +183,7 @@ def test_pinned_item_does_not_reopen():
     r = new_state["items"]["gh:1"]
     assert r["status"] == "open"
     assert r["reopen_count"] == 2  # pinned: no further reopen increments
+    assert r["last_updated"] == LATER  # pinned: display freshness still advances
 
 
 def test_resolution_requires_every_origin():
@@ -223,8 +235,8 @@ def test_retention_prune():
             "gh:new": rec(resolved_at="2026-09-27T00:00:00+00:00"),
         }
     )
-    # gh:new is open with resolved_at set only for the prune-status guard;
-    # open items are never pruned regardless of resolved_at.
+    # gh:new is auto-resolved that run and kept because resolved_at is fresh:
+    # the resolution pass stamps resolved_at = generated_at before pruning.
     new_state = merge_into_state(state, {}, {"github"}, "2026-09-28T07:00:00+00:00")
     assert "gh:old" not in new_state["items"]
     assert "gh:new" in new_state["items"]
@@ -255,14 +267,14 @@ def test_build_report_new_vs_still_open_disjoint():
 
 
 def test_build_report_bucketing():
+    # Fixed clock so the test cannot time-bomb around midnight or CI drift.
+    now = datetime.fromisoformat("2026-09-28T12:00:00+00:00")
     state = state_with(
         # After the items' first_seen (2026-09-20) so they count as still-open
         # and exercise bucketing rather than the New bucket.
         last_reviewed="2026-09-28T00:00:00+00:00",
         items={
-            "gh:t": rec(
-                first_seen="2026-09-20T00:00:00+00:00", last_updated=datetime.now(UTC).isoformat()
-            ),
+            "gh:t": rec(first_seen="2026-09-20T00:00:00+00:00", last_updated=now.isoformat()),
             "gh:w": rec(
                 first_seen="2026-09-20T00:00:00+00:00", last_updated="2026-09-25T00:00:00+00:00"
             ),
@@ -271,7 +283,7 @@ def test_build_report_bucketing():
             ),
         },
     )
-    report = build_report(state, datetime.now(UTC))
+    report = build_report(state, now)
     ids_today = [e["id"] for e in report["today"]]
     assert "gh:t" in ids_today
     assert [e["id"] for e in report["week"]] == ["gh:w"]
@@ -296,3 +308,144 @@ def test_render_attention_stdout_is_dry_view():
     assert "# Needs attention" in out
     assert "launchpad" in out
     assert "Status:" not in out
+
+
+def test_z_suffix_same_instant_no_false_reopen():
+    # "…Z" and "…+00:00" are the same instant; string comparison would see
+    # 'Z' > '+' and falsely reopen. Timestamps must be parsed, not compared.
+    state = state_with(
+        items={
+            "gh:1": rec(
+                status="acked",
+                acked=True,
+                last_updated="2026-09-29T10:00:00+00:00",
+            )
+        }
+    )
+    new_state = merge_into_state(
+        state,
+        merged_with(item(mid="gh:1", updated_at="2026-09-29T10:00:00Z")),
+        {"github"},
+        "2026-09-29T11:00:00+00:00",
+    )
+    r = new_state["items"]["gh:1"]
+    assert r["status"] == "acked"
+    assert r["reopen_count"] == 0
+
+
+def test_resolved_rereported_then_absent_regains_resolved_at():
+    # BUG-01 regression: resolved -> re-reported (same updated_at) resets
+    # resolved_at to None; a later absent run must re-stamp it, else the
+    # record is retained forever.
+    state = state_with(
+        items={"gh:1": rec(status="resolved", resolved_at="2026-09-01T07:00:00+00:00")}
+    )
+    suppressed = merge_into_state(state, merged_with(item(mid="gh:1")), {"github"}, NOW)
+    assert suppressed["items"]["gh:1"]["resolved_at"] is None
+    resolved_again = merge_into_state(suppressed, {}, {"github"}, LATER)
+    assert resolved_again["items"]["gh:1"]["status"] == "resolved"
+    assert resolved_again["items"]["gh:1"]["resolved_at"] == LATER
+    pruned = merge_into_state(resolved_again, {}, {"github"}, "2026-10-30T10:00:00+00:00")
+    assert "gh:1" not in pruned["items"]
+
+
+def test_acked_absent_keeps_status_and_gains_resolved_at():
+    state = state_with(
+        items={"gh:1": rec(status="acked", acked=True, acked_at="2026-09-28T06:30:00+00:00")}
+    )
+    new_state = merge_into_state(state, {}, {"github"}, "2026-09-28T07:00:00+00:00")
+    r = new_state["items"]["gh:1"]
+    assert r["status"] == "acked"
+    assert r["resolved_at"] == "2026-09-28T07:00:00+00:00"
+
+
+def test_re_report_resets_resolved_at():
+    state = state_with(
+        items={"gh:1": rec(status="resolved", resolved_at="2026-09-01T00:00:00+00:00")}
+    )
+    new_state = merge_into_state(state, merged_with(item(mid="gh:1")), {"github"}, NOW)
+    assert new_state["items"]["gh:1"]["resolved_at"] is None
+
+
+def test_pinned_never_auto_resolves():
+    state = state_with(items={"gh:1": rec(pinned=True)})
+    new_state = merge_into_state(state, {}, {"github"}, "2026-09-28T07:00:00+00:00")
+    r = new_state["items"]["gh:1"]
+    assert r["status"] == "open"
+    assert r["resolved_at"] is None
+
+
+def test_resolved_still_reported_with_no_resolved_at_not_pruned():
+    # A resolved record whose resolution was suppressed (resolved_at None)
+    # and that is still reported must survive the prune pass.
+    state = state_with(items={"gh:1": rec(status="resolved", resolved_at=None)})
+    new_state = merge_into_state(state, merged_with(item(mid="gh:1")), {"github"}, NOW)
+    assert "gh:1" in new_state["items"]
+    assert new_state["items"]["gh:1"]["resolved_at"] is None
+
+
+def test_exactly_30_days_boundary_prunes():
+    gen = "2026-09-28T07:00:00+00:00"
+    state = state_with(
+        items={"gh:1": rec(status="resolved", resolved_at="2026-08-29T07:00:00+00:00")}
+    )
+    new_state = merge_into_state(state, {}, {"github"}, gen)
+    assert "gh:1" not in new_state["items"]
+
+
+def test_coverage_line_exact_format():
+    md = render_digest_markdown(
+        state_with(), "# Git activity report", "2026-09-27T06:00:00+00:00", NOW, stale_providers=[]
+    )
+    assert "Coverage: Sun 27 Sep – Mon 28 Sep (1 day since last review)" in md
+    md2 = render_digest_markdown(
+        state_with(), "# Git activity report", "2026-09-26T06:00:00+00:00", NOW, stale_providers=[]
+    )
+    assert "Coverage: Sat 26 Sep – Mon 28 Sep (2 days since last review)" in md2
+
+
+def test_new_bucket_sorted_newest_first():
+    state = state_with(
+        last_reviewed="2026-09-27T06:00:00+00:00",
+        items={
+            "gh:early": rec(first_seen="2026-09-28T06:00:00+00:00", last_updated=NOW),
+            "gh:late": rec(first_seen="2026-09-28T07:00:00+00:00", last_updated=LATER),
+        },
+    )
+    report = build_report(state, datetime.fromisoformat(NOW))
+    assert [e["id"] for e in report["new"]] == ["gh:late", "gh:early"]
+
+
+def _report_with(entry):
+    return {"new": [entry], "today": [], "week": [], "older": []}
+
+
+def test_url_guard_javascript_scheme_no_link():
+    entry = {"id": "gh:1", "title": "Evil", "url": "javascript:alert(1)", "reasons": []}
+    out = render_attention_body(_report_with(entry), [])
+    assert "- Evil" in out
+    assert "javascript:" not in out
+
+
+def test_url_guard_parens_no_link():
+    entry = {
+        "id": "gh:1",
+        "title": "Odd",
+        "url": "https://example.com/a(b) [x]",
+        "reasons": [],
+    }
+    out = render_attention_body(_report_with(entry), [])
+    assert "- Odd" in out
+    assert "](https://example.com" not in out
+
+
+def test_titles_not_re_escaped():
+    entry = {
+        "id": "gh:1",
+        "title": "Fix &amp; ship &lt;3",
+        "url": "https://example.com/1",
+        "reasons": [],
+    }
+    out = render_attention_body(_report_with(entry), [])
+    assert "Fix &amp; ship &lt;3" in out
+    assert "&amp;amp;" not in out

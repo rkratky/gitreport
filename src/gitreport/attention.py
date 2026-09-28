@@ -1,6 +1,7 @@
 """Merge provider attention results with state; render the digest."""
 
 import copy
+import re
 from datetime import UTC, datetime, timedelta
 
 PRUNE_AFTER = timedelta(days=30)
@@ -8,13 +9,26 @@ MAX_REASONS = 10
 BUCKETS = ("today", "week", "older")
 BUCKET_TITLES = {"today": "Today", "week": "Last 7 days", "older": "Older than 7 days"}
 
+# A URL is rendered as a Markdown link only when it is http(s) and free of
+# characters that would break the [title](url) syntax or smuggle markup.
+_URL_UNSAFE = re.compile(r"[\s()<>]")
+_EPOCH = datetime.min.replace(tzinfo=UTC)
+
+
+def _parse(ts: str) -> datetime:
+    """Parse an ISO timestamp; naive values are treated as UTC."""
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
 
 def _is_later(a: str | None, b: str | None) -> bool:
     if a is None:
         return False
     if b is None:
         return True
-    return a > b
+    return _parse(a) > _parse(b)
 
 
 def dedupe(results: dict[str, dict]) -> dict[str, dict]:
@@ -76,9 +90,9 @@ def merge_into_state(
         if r is None:
             items[mid] = {
                 "status": "open",
-                "origins": m["origins"],
-                "kinds": m["kinds"],
-                "reasons": m["reasons"],
+                "origins": list(m["origins"]),
+                "kinds": list(m["kinds"]),
+                "reasons": list(m["reasons"]),
                 "repo": m["repo"],
                 "title": m["title"],
                 "url": m["url"],
@@ -105,10 +119,11 @@ def merge_into_state(
             r["thread_url"] = m["thread_url"]
         if new_event:
             r["repo"], r["title"], r["url"] = m["repo"], m["title"], m["url"]
+            # The latest event advances freshness for every record, pinned
+            # included; pinned only keeps status/reopen_count untouched below.
+            r["last_updated"] = m["updated_at"]
             if r.get("pinned"):
                 pass  # pinned: refresh display only; stays open
-            elif r["status"] == "open":
-                r["last_updated"] = m["updated_at"]
             elif r["status"] in ("acked", "resolved"):
                 r.update(
                     status="open",
@@ -116,7 +131,6 @@ def merge_into_state(
                     acked_at=None,
                     resolved_at=None,
                     reopen_count=r.get("reopen_count", 0) + 1,
-                    last_updated=m["updated_at"],
                 )
 
     # 2. Resolution pass — absence-based, only for fully-fetched providers.
@@ -127,19 +141,16 @@ def merge_into_state(
             if r["status"] == "open":
                 r["status"] = "resolved"
                 r["resolved_at"] = generated_at
-            elif r["status"] == "acked" and r.get("resolved_at") is None:
+            elif r["status"] in ("acked", "resolved") and r.get("resolved_at") is None:
                 r["resolved_at"] = generated_at
 
     # 3. Retention prune.
-    gen = datetime.fromisoformat(generated_at)
+    gen = _parse(generated_at)
     for mid in list(items):
         r = items[mid]
         if r["status"] not in ("acked", "resolved") or r.get("resolved_at") is None:
             continue
-        resolved = datetime.fromisoformat(r["resolved_at"])
-        if resolved.tzinfo is None:
-            resolved = resolved.replace(tzinfo=UTC)
-        if (gen - resolved) >= PRUNE_AFTER:
+        if (gen - _parse(r["resolved_at"])) >= PRUNE_AFTER:
             del items[mid]
 
     st["last_digest_run"] = generated_at
@@ -154,7 +165,10 @@ def build_report(state: dict, now: datetime) -> dict:
     for mid, r in sorted(state["items"].items()):
         if r.get("status") != "open":
             continue
-        is_new = not last_reviewed or (r.get("first_seen") or "") > last_reviewed
+        first_seen = r.get("first_seen") or ""
+        is_new = not last_reviewed or (
+            first_seen != "" and _parse(first_seen) > _parse(last_reviewed)
+        )
         entry = {
             "id": mid,
             "repo": r.get("repo", ""),
@@ -170,7 +184,7 @@ def build_report(state: dict, now: datetime) -> dict:
     now_local = now.astimezone()
     for entry in still_open:
         lu = entry["last_updated"]
-        when = datetime.fromisoformat(lu).astimezone() if lu else None
+        when = _parse(lu).astimezone() if lu else None
         if when is None or when.date() == now_local.date():
             bucket = "today"
         elif when >= now_local - timedelta(days=7):
@@ -179,19 +193,22 @@ def build_report(state: dict, now: datetime) -> dict:
             bucket = "older"
         buckets[bucket].append(entry)
 
-    new_items.sort(key=lambda e: e["last_updated"] or "", reverse=True)
+    new_items.sort(
+        key=lambda e: _parse(e["last_updated"]) if e["last_updated"] else _EPOCH,
+        reverse=True,
+    )
     return {"new": new_items, **buckets}
 
 
 def _fmt_local(ts: str) -> str:
-    dt = datetime.fromisoformat(ts).astimezone()
+    dt = _parse(ts).astimezone()
     return f"{dt:%a} {dt.day} {dt:%b}"
 
 
 def _entry_line(entry: dict) -> str:
     title = entry.get("title") or entry["id"]
     url = entry.get("url", "")
-    if url.startswith(("http://", "https://")):
+    if url.startswith(("http://", "https://")) and not _URL_UNSAFE.search(url):
         line = f"- [{title}]({url})"
     else:
         line = f"- {title}"
@@ -239,8 +256,8 @@ def render_digest_markdown(
     generated_at: str,
     stale_providers: list[str],
 ) -> str:
-    start_dt = datetime.fromisoformat(coverage_start)
-    end_dt = datetime.fromisoformat(generated_at)
+    start_dt = _parse(coverage_start)
+    end_dt = _parse(generated_at)
     days = max(1, (end_dt - start_dt).days)
     unit = "day" if days == 1 else "days"
     coverage = (
