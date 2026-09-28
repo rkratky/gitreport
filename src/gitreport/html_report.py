@@ -55,8 +55,10 @@ def strip_front_matter(md_text: str) -> tuple[dict, str]:
     match = re.match(r"\A---\r?\n(?:(.*?)\r?\n)?---\r?\n", md_text, re.DOTALL)
     if not match:
         return {}, md_text
+    # BUG-R2-01: with empty front matter the optional meta group does not
+    # participate in the match, so group(1) is None — treat it as "".
     meta: dict = {}
-    for line in match.group(1).splitlines():
+    for line in (match.group(1) or "").splitlines():
         key, _, value = line.partition(":")
         if key and value:
             meta[key.strip()] = value.strip()

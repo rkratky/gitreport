@@ -122,6 +122,18 @@ def test_strip_front_matter_value_with_dashes():
     assert body.startswith("\nbody\n")
 
 
+def test_strip_front_matter_empty_block():
+    # BUG-R2-01: empty front matter (`---\n---\nbody`) crashed — the optional
+    # meta group does not participate in the match, so group(1) is None and
+    # .splitlines() was called on it.
+    assert strip_front_matter("---\n---\nbody\n") == ({}, "body\n")
+
+
+def test_strip_front_matter_empty_block_crlf():
+    # BUG-R2-01: same crash for CRLF empty front matter.
+    assert strip_front_matter("---\r\n---\r\nbody\r\n") == ({}, "body\r\n")
+
+
 def test_render_html_preserves_literal_title_in_prose():
     # N-02: the title-attribute strip must only touch attributes inside <a>
     # tags — literal `title="hi"` in prose must survive rendering untouched.
