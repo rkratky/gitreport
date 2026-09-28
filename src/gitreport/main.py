@@ -180,6 +180,8 @@ def _fetch_attention(providers, since, exclusions, state_items, stale_pr_days):
 
     Returns (results, stale_providers). A provider failure — constructor or
     fetch — yields ok=False and the provider name in stale_providers.
+    `exclusions` maps provider name -> list of glob patterns; each provider
+    only receives its own patterns (BUG-01).
     """
     results = {}
     stale = []
@@ -190,7 +192,7 @@ def _fetch_attention(providers, since, exclusions, state_items, stale_pr_days):
             try:
                 fetch = provider.get_attention(
                     since,
-                    exclusions=exclusions,
+                    exclusions=exclusions.get(name, []),
                     state_items=state_items,
                     stale_pr_days=stale_pr_days,
                 )
@@ -246,10 +248,9 @@ def attention(config_path_str):
     att = config.attention
     state = load_state_snapshot(att.state_path)
     providers = _build_providers(config)
-    exclusions = att.exclusions.get("github", []) + att.exclusions.get("launchpad", [])
     state_items = {mid: rec.model_dump() for mid, rec in state.items.items()}
     results, stale = _fetch_attention(
-        providers, _attention_since(state), exclusions, state_items, att.stale_pr_days
+        providers, _attention_since(state), att.exclusions, state_items, att.stale_pr_days
     )
     merged = dedupe(results)
     # Dry-run view: overlay merged items on the state without persisting.
@@ -277,9 +278,10 @@ def digest(config_path_str, open_browser):
     pre_state = load_state_snapshot(att.state_path)
     generated_at = datetime.now(UTC).isoformat()
     since = _attention_since(pre_state)
-    exclusions = att.exclusions.get("github", []) + att.exclusions.get("launchpad", [])
     state_items = {mid: rec.model_dump() for mid, rec in pre_state.items.items()}
-    results, stale = _fetch_attention(providers, since, exclusions, state_items, att.stale_pr_days)
+    results, stale = _fetch_attention(
+        providers, since, att.exclusions, state_items, att.stale_pr_days
+    )
     activity_data, activity_stale = _fetch_activity(providers, since, datetime.now(UTC))
 
     merged = dedupe(results)

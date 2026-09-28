@@ -7,31 +7,31 @@
 providers:
   github:
     username: "your-github-username"
-    token: "your-github-personal-access-token" # Needs repo and user scopes for private repos
+    token: "your-github-personal-access-token" # Classic PAT; repo + user scopes, plus notifications for the attention digest
   launchpad:
     username: "your-launchpad-id"
     # No token needed: Launchpad auth uses saved OAuth credentials created by
     # `poetry run python auth_launchpad.py`. The token field may be omitted.
 
-# Attention digest — the whole block is optional; the values below are the
-# defaults. See README "Attention digest" and "State file".
-attention:
-  # Per-provider glob patterns matched against owner/repo (GitHub) or the
-  # project name (Launchpad). Applies to attention items only; the activity
-  # report is unchanged.
-  exclusions:
-    github: ["owner/fork-name", "me/dotfiles"]
-    launchpad: ["noise-project"]
-  # Flag my open PRs as stale after this many days without updates.
-  stale_pr_days: 7
-  # Inbox state file.
-  state_path: ~/.local/state/gitreport/state.json
-  # Published digest formats. `md` is always written (infrastructure for
-  # `gitreport read`) and must not be omitted; omitting `html` skips the
-  # HTML file and makes `--open` open the `.md`.
-  digest_formats: [html, md]
-  # Extension-less stems. The YYYY-MM-DD token in digest_output is replaced
-  # with the local date; same-day reruns overwrite the dated files.
-  # digest_latest is refreshed to the newest digest on every run.
-  digest_output: ~/.local/state/gitreport/digests/YYYY-MM-DD
-  digest_latest: ~/.local/state/gitreport/digests/latest
+# Attention digest — the whole block is optional. Uncomment and adjust as
+# needed; defaults are shown in the README's config reference.
+# attention:
+#   # Per-provider glob patterns matched against owner/repo (GitHub) or the
+#   # project name (Launchpad). Applies to attention items only; the activity
+#   # report is unchanged.
+#   exclusions:
+#     github: ["owner/fork-name", "me/dotfiles"]
+#     launchpad: ["noise-project"]
+#   # Flag my open PRs as stale after this many days without updates.
+#   stale_pr_days: 7
+#   # Inbox state file.
+#   state_path: ~/.local/state/gitreport/state.json
+#   # Published digest formats. `md` is always written (infrastructure for
+#   # `gitreport read`) and must not be omitted; omitting `html` skips the
+#   # HTML file and makes `--open` open the `.md`.
+#   digest_formats: [html, md]
+#   # Extension-less stems. The YYYY-MM-DD token in digest_output is replaced
+#   # with the local date; same-day reruns overwrite the dated files.
+#   # digest_latest is refreshed to the newest digest on every run.
+#   digest_output: ~/.local/state/gitreport/digests/YYYY-MM-DD
+#   digest_latest: ~/.local/state/gitreport/digests/latest

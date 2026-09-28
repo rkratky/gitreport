@@ -89,6 +89,22 @@ class NoopProvider(GitProvider):
         pass
 
 
+class RecordingProvider(GitProvider):
+    """Noop variant whose instances record the exclusions kwarg (BUG-01)."""
+
+    get_activity = MagicMock()
+    instances = []
+
+    def __init__(self, username, token):
+        self.username = username
+        self.seen_exclusions = []
+        RecordingProvider.instances.append(self)
+
+    def get_attention(self, since, exclusions=None, state_items=None, stale_pr_days=None):
+        self.seen_exclusions.append(exclusions)
+        return {"ok": True, "items": [], "resolved_ids": [], "error": None}
+
+
 @patch("gitreport.main.load_config")
 @patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
 def test_digest_creates_files_and_symlinks(mock_load_config, tmp_path_factory):
@@ -133,6 +149,47 @@ def test_digest_provider_failure_degrades(mock_load_config, tmp_path_factory):
 
     assert result.exit_code == 0  # degraded, not aborted
     assert "stale" in result.output.lower()
+
+
+@patch("gitreport.main.load_config")
+@patch(
+    "gitreport.main.PROVIDER_MAP",
+    {"github": RecordingProvider, "launchpad": RecordingProvider},
+)
+def test_digest_passes_per_provider_exclusions(mock_load_config, tmp_path_factory):
+    """Each provider receives only its own exclusion patterns (BUG-01)."""
+    RecordingProvider.instances.clear()
+    tmp = tmp_path_factory.mktemp("exclusions")
+    config = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+        providers={
+            "github": ProviderConfig(username="gh-user", token="t"),
+            "launchpad": ProviderConfig(username="lp-user"),
+        },
+    )
+    config.attention.exclusions = {"github": ["gh-*"], "launchpad": ["lp-*"]}
+    mock_load_config.return_value = config
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp / "digests" / "2026-09-28.md").exists()
+    by_username = {p.username: p for p in RecordingProvider.instances}
+    assert by_username["gh-user"].seen_exclusions == [["gh-*"]]
+    assert by_username["lp-user"].seen_exclusions == [["lp-*"]]
+
+    # The dry-run `attention` command resolves exclusions the same way; it
+    # builds fresh provider instances, so look those up by username.
+    n_after_digest = len(RecordingProvider.instances)
+    result = runner.invoke(cli, ["attention"])
+
+    assert result.exit_code == 0, result.output
+    attention_by_username = {p.username: p for p in RecordingProvider.instances[n_after_digest:]}
+    assert attention_by_username["gh-user"].seen_exclusions == [["gh-*"]]
+    assert attention_by_username["lp-user"].seen_exclusions == [["lp-*"]]
 
 
 @patch("gitreport.main.load_config")

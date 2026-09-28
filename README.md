@@ -157,8 +157,9 @@ you have dealt with them.
     prune); writes the dated digest and refreshes the `latest` links; prints
     the digest Markdown. `--open` opens the digest in a browser. Does **not**
     advance the review cursor.
-*   `gitreport read`: mark the newest digest(s) consumed and re-render their
-    status line. `--open` also opens `latest`.
+*   `gitreport read`: mark the newest digest(s) consumed (on the first-ever
+    read, only the newest digest) and re-render their status line. `--open`
+    also opens `latest`.
 *   `gitreport ack [ID]`: mark item(s) done. `ID` is an item id or substring
     (interactive disambiguation when ambiguous); `--list` (or no `ID`)
     browses open items. Acking a GitHub-notification item also marks that
@@ -179,7 +180,7 @@ Every digest starts with two lines that have different lifetimes:
 *   **Coverage line** — frozen at generation, always historically true:
 
     ```text
-    Coverage: Mon 22 – Mon 28 Sep (6 days since last review)
+    Coverage: Mon 22 Sep – Mon 28 Sep (6 days since last review)
     ```
 
     On a first-ever run the start is a 24-hour fallback.
@@ -314,9 +315,12 @@ wall-clock time of that read, used for the status line), and
 
 **Corruption:** writes are atomic (temporary file + rename) and happen under
 an exclusive lock, so corruption is unlikely. If the file is ever unreadable,
-it is renamed to `state.json.corrupt-<timestamp>` and an empty state is
-rebuilt, with a warning on stderr. **Ack/read history in the renamed file is
-lost**, though the backup remains on disk for manual inspection.
+the next state-mutating command (`digest`, `read`, `ack`, `unack`) renames it
+to `state.json.corrupt-<timestamp>` and rebuilds an empty state, with a
+warning on stderr; read-only views (`attention`, `ack --list`) treat the
+corrupt file as empty without renaming it or warning. **Ack/read history in
+the renamed file is lost**, though the backup remains on disk for manual
+inspection.
 
 **Retention:** an `acked` or `resolved` item is pruned 30 days after its
 sources stopped reporting it. While any source still reports an acked item,
