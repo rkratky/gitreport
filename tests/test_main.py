@@ -1,5 +1,12 @@
+import json
+import os
+import re
+import threading
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from gitreport.config import Config, ProviderConfig
@@ -144,6 +151,8 @@ def test_read_advances_cursor_and_restamps(mock_load_config, tmp_path_factory):
     assert result.exit_code == 0, result.output
     md_text = (tmp / "digests" / "2026-09-28.md").read_text()
     assert "Status: Reviewed" in md_text
+    # Spec format in local time: `Status: Reviewed Mon 28 Sep 09:14` (BUG-10).
+    assert re.search(r"Status: Reviewed \w{3} \d{1,2} \w{3} \d{2}:\d{2}", md_text)
     assert "NOT YET REVIEWED" not in md_text
     import json
 
@@ -156,7 +165,6 @@ def test_read_advances_cursor_and_restamps(mock_load_config, tmp_path_factory):
 @patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
 def test_ack_and_unack_roundtrip(mock_load_config, tmp_path_factory):
     tmp = tmp_path_factory.mktemp("ack")
-    item_id = "gh:https://github.com/o/r/pull/1"
     state = AttentionState(
         last_digest_run="2026-09-28T06:00:00+00:00",
         last_reviewed="2026-09-27T06:00:00+00:00",
@@ -164,7 +172,12 @@ def test_ack_and_unack_roundtrip(mock_load_config, tmp_path_factory):
     # Seed state directly via save_state in the test.
     from gitreport.state import save_state
 
+    item_id = "gh:https://github.com/o/r/pull/1"
+    resolved_id = "gh:https://github.com/o/r/pull/3"
     state.items[item_id] = _seed_item(item_id)
+    state.items[resolved_id] = _seed_item(
+        resolved_id, status="resolved", resolved_at="2026-09-27T07:00:00+00:00"
+    )
     save_state(tmp / "state.json", state)
 
     mock_load_config.return_value = _config_with(
@@ -189,21 +202,35 @@ def test_ack_and_unack_roundtrip(mock_load_config, tmp_path_factory):
     assert reopened["items"][item_id]["status"] == "open"
     assert reopened["items"][item_id]["reopen_count"] == 1
 
+    # Unacking a resolved item also clears the resolution stamp (BUG-05).
+    result = runner.invoke(cli, ["unack", "o/r/pull/3"])
+    assert result.exit_code == 0, result.output
 
-def _seed_item(item_id):
+    unacked = json.loads((tmp / "state.json").read_text())
+    unacked_item = unacked["items"][resolved_id]
+    assert unacked_item["status"] == "open"
+    assert unacked_item["resolved_at"] is None
+    assert unacked_item["pinned"] is True  # previously-resolved: pinned
+    assert unacked_item["reopen_count"] == 1
+    assert unacked_item["acked"] is False
+
+
+def _seed_item(item_id, **overrides):
     from gitreport.state import ItemState
 
-    return ItemState(
+    defaults = dict(
         status="open",
         origins=["query"],
         kinds=["mention"],
         reasons=["r"],
         repo="o/r",
         title="T",
-        url="https://github.com/o/r/pull/1",
+        url=item_id.split(":", 1)[-1],  # "gh:https://..." -> the url part
         first_seen="2026-09-28T06:00:00+00:00",
         last_updated="2026-09-28T06:00:00+00:00",
     )
+    defaults.update(overrides)
+    return ItemState(**defaults)
 
 
 def _config_with(state_path, stem, latest, providers=None):
@@ -332,6 +359,7 @@ def test_unack_resolved_item_pins(mock_load_config, tmp_path):
     assert item["pinned"] is True  # previously-resolved: pin so it cannot re-resolve
     assert item["reopen_count"] == 1
     assert item["acked"] is False
+    assert item["resolved_at"] is None  # un-resolving clears the stamp (BUG-05)
 
 
 @patch("gitreport.main.load_config")
@@ -424,3 +452,232 @@ def test_read_without_digests_is_a_noop(mock_load_config, tmp_path):
     assert result.exit_code == 0, result.output
     assert "No digests to mark read." in result.output
     assert not (tmp_path / "state.json").exists()
+
+
+@patch("gitreport.main.load_config")
+def test_ack_prompts_outside_the_state_lock(mock_load_config, tmp_path):
+    """BUG-02: the disambiguation prompt must not hold the state lock.
+
+    While click.prompt is pending, a background thread must be able to
+    acquire the lock (2s budget); the chosen item is then acked normally.
+    """
+    from gitreport.state import ItemState, save_state
+
+    ids = ["gh:https://github.com/o/r/pull/1", "gh:https://github.com/o/r/pull/2"]
+    state = AttentionState()
+    for i, mid in enumerate(ids, 1):
+        state.items[mid] = ItemState(
+            status="open",
+            origins=["notification"],
+            kinds=["mention"],
+            reasons=["r"],
+            repo="o/r",
+            title=f"PR {i}",
+            url=f"https://github.com/o/r/pull/{i}",
+            first_seen="2026-09-28T06:00:00+00:00",
+            last_updated="2026-09-28T06:00:00+00:00",
+            thread_url=f"https://api.github.com/notifications/threads/{i}",
+        )
+    save_state(tmp_path / "state.json", state)
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=tmp_path / "digests" / "2026-09-28",
+        latest=tmp_path / "digests" / "latest",
+    )
+
+    lock_free = threading.Event()
+    acquired_during_prompt: list[bool] = []
+
+    def fake_prompt(*args, **kwargs):
+        holder = threading.Thread(
+            target=lambda: _touch_lock(tmp_path / "state.json", lock_free), daemon=True
+        )
+        holder.start()
+        acquired_during_prompt.append(lock_free.wait(timeout=2.0))
+        holder.join(timeout=5.0)
+        return "1"  # pick the first match
+
+    runner = CliRunner()
+    with patch("gitreport.main.click.prompt", side_effect=fake_prompt):
+        result = runner.invoke(cli, ["ack", "o/r/pull"])
+
+    assert result.exit_code == 0, result.output
+    assert acquired_during_prompt == [True]  # lock was free while the prompt ran
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["items"][ids[0]]["status"] == "acked"  # mutation applied
+    assert saved["items"][ids[1]]["status"] == "open"
+
+
+def _touch_lock(state_path, lock_free):
+    from gitreport.state import state_lock
+
+    with state_lock(state_path):
+        lock_free.set()
+
+
+def _assert_clean_cli_error(result, message_fragment):
+    """The command failed cleanly: exit != 0, message printed, no raw traceback.
+
+    click's BaseCommand.main handles ClickException itself (message + exit 1),
+    so CliRunner records SystemExit(1) rather than the ClickException object;
+    a bare exception class leaking here means the try/except is missing.
+    """
+    assert result.exit_code != 0
+    assert message_fragment in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+@patch("gitreport.main.load_config")
+def test_digest_provider_ctor_failure_degrades(mock_load_config, tmp_path):
+    """BUG-03: a provider whose constructor raises must not abort the digest."""
+
+    class CtorBoomProvider(GitProvider):
+        get_activity = MagicMock()
+        get_attention = MagicMock()
+
+        def __init__(self, username, token):
+            raise RuntimeError("ctor boom")
+
+    item_id = "mock:https://github.com/o/r/pull/9"
+    (tmp_path / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "last_digest_run": None,
+                "last_reviewed": None,
+                "reviewed_at": None,
+                "items": {
+                    item_id: {
+                        "status": "open",
+                        "origins": ["query"],
+                        "kinds": ["stale_pr"],
+                        "reasons": ["no activity"],
+                        "repo": "o/r",
+                        "title": "PR nine",
+                        "url": "https://github.com/o/r/pull/9",
+                        "first_seen": "2026-09-27T06:00:00+00:00",
+                        "last_updated": "2026-09-27T06:00:00+00:00",
+                        "provider": "mock",
+                    }
+                },
+            }
+        )
+    )
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=tmp_path / "digests" / "2026-09-28",
+        latest=tmp_path / "digests" / "latest",
+    )
+
+    with patch("gitreport.main.PROVIDER_MAP", {"mock": CtorBoomProvider}):
+        result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output  # degraded, not aborted
+    assert "could not initialise provider mock" in result.output
+    assert "stale" in result.output.lower()
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["items"][item_id]["status"] == "open"  # ctor failure: no absence-resolution
+
+
+@patch("gitreport.main.load_config")
+def test_ack_zero_matches_fails_cleanly(mock_load_config, tmp_path):
+    """BUG-06: zero matches exit non-zero via ClickException, not a traceback."""
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=tmp_path / "digests" / "2026-09-28",
+        latest=tmp_path / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["ack", "no-such-thing"])
+
+    _assert_clean_cli_error(result, "No open item matches 'no-such-thing'")
+
+
+@patch("gitreport.main.load_config")
+def test_unack_zero_matches_fails_cleanly(mock_load_config, tmp_path):
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=tmp_path / "digests" / "2026-09-28",
+        latest=tmp_path / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["unack", "no-such-thing"])
+
+    _assert_clean_cli_error(result, "No acked or resolved item matches 'no-such-thing'")
+
+
+@patch("gitreport.main.load_config")
+def test_unack_open_item_is_rejected(mock_load_config, tmp_path):
+    """BUG-05: unack matches only acked/resolved items, never open ones."""
+    from gitreport.state import save_state
+
+    item_id = "gh:https://github.com/o/r/pull/1"
+    state = AttentionState()
+    state.items[item_id] = _seed_item(item_id)
+    save_state(tmp_path / "state.json", state)
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=tmp_path / "digests" / "2026-09-28",
+        latest=tmp_path / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["unack", "o/r/pull/1"])
+
+    _assert_clean_cli_error(result, "No acked or resolved item matches")
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_writes_dot_stem_paths_correctly(mock_load_config, tmp_path_factory):
+    """BUG-08: a dot in the static part of digest_output must not break paths."""
+    tmp = tmp_path_factory.mktemp("dotstem")
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "a.b" / today,
+        latest=tmp / "a.b" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp / "a.b" / f"{today}.md").exists()
+    assert (tmp / "a.b" / f"{today}.html").exists()
+    assert (tmp / "a.b" / "latest.md").is_symlink()
+    assert (tmp / "a.b" / "latest.html").is_symlink()
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_symlink_target_is_absolute_for_relative_config(mock_load_config, tmp_path, monkeypatch):
+    """BUG-09: with a relative digest_output, latest.md must still resolve."""
+    monkeypatch.chdir(tmp_path)
+    mock_load_config.return_value = _config_with(
+        state_path=tmp_path / "state.json",
+        stem=Path("digests/2026-09-28"),  # literal date: stable regardless of today
+        latest=Path("digests/latest"),
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    link = tmp_path / "digests" / "latest.md"
+    assert link.is_symlink()
+    target = os.readlink(link)
+    assert os.path.isabs(target)
+    assert link.resolve() == tmp_path / "digests" / "2026-09-28.md"
+    assert link.exists()  # symlink resolves to the dated file
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["attention"], ["digest"], ["read"], ["ack", "x"], ["unack", "x"]],
+)
+@patch("gitreport.main.load_config")
+def test_commands_fail_cleanly_on_bad_config(mock_load_config, argv):
+    """BUG-11: the five new commands map config errors to ClickException."""
+    mock_load_config.side_effect = FileNotFoundError("Configuration file not found.")
+
+    result = CliRunner().invoke(cli, argv)
+
+    _assert_clean_cli_error(result, "Configuration file not found.")

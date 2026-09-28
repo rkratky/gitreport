@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import webbrowser
@@ -8,9 +7,9 @@ from pathlib import Path
 import click
 import dateparser
 from github import BadCredentialsException
-from pydantic import Field
 
 from .attention import (
+    _parse,
     dedupe,
     merge_into_state,
     render_attention_stdout,
@@ -24,8 +23,8 @@ from .providers.launchpad import LaunchpadProvider
 from .reporting import generate_report
 from .state import (
     AttentionState,
-    ItemState,
     load_state,
+    load_state_snapshot,
     prune,
     record_read,
     save_state,
@@ -37,56 +36,15 @@ PROVIDER_MAP: dict[str, type[GitProvider]] = {
     "launchpad": LaunchpadProvider,
 }
 
-_THREAD_ITEM_EXTRAS = ("thread_url", "provider")
 
-
-class _ThreadedItemState(ItemState):
-    """ItemState plus the merge-layer extras (thread_url/provider).
-
-    attention.merge_into_state emits both keys in its dict output, but plain
-    ItemState validation drops them (pydantic extra="ignore"): digest would
-    persist a state.json without the GitHub thread url that `ack` PATCHes to
-    mark notifications read. Declaring the fields keeps the round-trip.
-    """
-
-    thread_url: str | None = None
-    provider: str | None = None
-
-
-class _ThreadedState(AttentionState):
-    """AttentionState whose items keep the merge-layer extras."""
-
-    # type: ignore needed: dict[str, ItemState] -> dict[str, _ThreadedItemState]
-    # is a deliberate narrowing override; pyright calls it invariant-unsafe.
-    items: dict[str, _ThreadedItemState] = Field(default_factory=dict)  # type: ignore[assignment]
-
-
-def _load_threaded_state(path: Path) -> _ThreadedState:
-    """`load_state` plus the merge-layer extras (thread_url/provider) kept.
-
-    state.py's ItemState drops those keys when validating, so the digest
-    persists them via _ThreadedState and every state-mutating command reloads
-    them here. load_state keeps the canonical missing/corrupt/version
-    handling; malformed extra values degrade to None (the thread PATCH is
-    best-effort, never load-bearing).
-    """
-    base = load_state(path).model_dump()
+def _load_config(config_path_str: Path | None):
+    """load_config with the shared missing/invalid-config -> ClickException
+    handling (same behaviour as `generate`'s own wrapping), so a bad config
+    never escapes any command as a raw traceback."""
     try:
-        raw = json.loads(path.read_text())
-    except (OSError, ValueError):
-        raw = {}
-    raw_items = raw.get("items") if isinstance(raw, dict) else {}
-    if not isinstance(raw_items, dict):
-        raw_items = {}
-    for mid, item in base["items"].items():
-        raw_item = raw_items.get(mid)
-        if not isinstance(raw_item, dict):
-            continue
-        for key in _THREAD_ITEM_EXTRAS:
-            value = raw_item.get(key)
-            if value is None or isinstance(value, str):
-                item[key] = value
-    return _ThreadedState.model_validate(base)
+        return load_config(config_path_str)
+    except (FileNotFoundError, ValueError) as e:
+        raise click.ClickException(str(e)) from e
 
 
 @click.group()
@@ -192,33 +150,52 @@ def generate(config_path_str: Path | None, start_date: str, end_date: str, fast:
         raise click.ClickException(str(e)) from e
 
 
-def _build_providers(config) -> dict[str, tuple[GitProvider, str]]:
-    """Instantiate providers; returns name -> (provider, display_name)."""
-    providers = {}
+def _build_providers(config) -> dict[str, GitProvider | None]:
+    """Instantiate providers; name -> provider, or None when construction fails.
+
+    A constructor failure (e.g. missing Launchpad credentials) must not abort
+    the command: the None placeholder makes the fetch loops record a failed
+    fetch, so the section is marked stale and no items resolve by that
+    provider's absence.
+    """
+    providers: dict[str, GitProvider | None] = {}
     for name, pc in config.providers.items():
         cls = PROVIDER_MAP.get(name)
         if cls is None:
             continue
         token = pc.token.get_secret_value() if pc.token is not None else None
-        providers[name] = (cls(username=pc.username, token=token), name)
+        try:
+            providers[name] = cls(username=pc.username, token=token)
+        except Exception as e:  # noqa: BLE001
+            click.echo(
+                f"Warning: could not initialise provider {name} ({e}); its section may be stale.",
+                err=True,
+            )
+            providers[name] = None
     return providers
 
 
 def _fetch_attention(providers, since, exclusions, state_items, stale_pr_days):
     """Fetch attention items from every provider; network, outside the lock.
 
-    Returns (results, stale_providers). A provider failure yields
-    ok=False and the provider name in stale_providers.
+    Returns (results, stale_providers). A provider failure — constructor or
+    fetch — yields ok=False and the provider name in stale_providers.
     """
     results = {}
     stale = []
-    for name, (provider, _display) in providers.items():
-        try:
-            fetch = provider.get_attention(
-                since, exclusions=exclusions, state_items=state_items, stale_pr_days=stale_pr_days
-            )
-        except Exception as e:  # noqa: BLE001
-            fetch = {"ok": False, "items": [], "resolved_ids": [], "error": str(e)}
+    for name, provider in providers.items():
+        if provider is None:
+            fetch = {"ok": False, "items": [], "resolved_ids": [], "error": "not initialised"}
+        else:
+            try:
+                fetch = provider.get_attention(
+                    since,
+                    exclusions=exclusions,
+                    state_items=state_items,
+                    stale_pr_days=stale_pr_days,
+                )
+            except Exception as e:  # noqa: BLE001
+                fetch = {"ok": False, "items": [], "resolved_ids": [], "error": str(e)}
         results[name] = fetch
         if not fetch["ok"]:
             stale.append(name)
@@ -229,12 +206,17 @@ def _fetch_activity(providers, start, end, fast=False):
     """Fetch activity from every provider; degrade on failure, never abort.
 
     Returns (provider_data: dict[str, dict[str, RepoActivity]], stale: list).
-    Bad credentials are a per-provider failure here (warning + skip) — only
+    A None provider (constructor failure, already warned by _build_providers)
+    is treated as a failed fetch: no data, section marked stale. Bad
+    credentials are a per-provider failure here too (warning + skip) — only
     the standalone `generate` command aborts on them (non-goal to change).
     """
     provider_data: dict = {}
     stale: list[str] = []
-    for name, (provider, _display) in providers.items():
+    for name, provider in providers.items():
+        if provider is None:
+            stale.append(name)
+            continue
         try:
             provider_data[name] = provider.get_activity(start, end, fast=fast)
         except BadCredentialsException:
@@ -260,14 +242,14 @@ def _fetch_activity(providers, start, end, fast=False):
 )
 def attention(config_path_str):
     """Show what needs attention (dry run; does not mutate state)."""
-    config = load_config(config_path_str)
+    config = _load_config(config_path_str)
     att = config.attention
-    state = load_state(att.state_path)
+    state = load_state_snapshot(att.state_path)
     providers = _build_providers(config)
     exclusions = att.exclusions.get("github", []) + att.exclusions.get("launchpad", [])
     state_items = {mid: rec.model_dump() for mid, rec in state.items.items()}
     results, stale = _fetch_attention(
-        providers, datetime.now(UTC), exclusions, state_items, att.stale_pr_days
+        providers, _attention_since(state), exclusions, state_items, att.stale_pr_days
     )
     merged = dedupe(results)
     # Dry-run view: overlay merged items on the state without persisting.
@@ -287,16 +269,14 @@ def attention(config_path_str):
 @click.option("--open", "open_browser", is_flag=True, default=False)
 def digest(config_path_str, open_browser):
     """Morning run: attention + activity; writes the digest; updates state."""
-    config = load_config(config_path_str)
+    config = _load_config(config_path_str)
     att = config.attention
     providers = _build_providers(config)
 
-    # Snapshot for fetches (outside the lock).
-    pre_state = load_state(att.state_path)
+    # Snapshot for fetches (outside the lock; non-mutating read).
+    pre_state = load_state_snapshot(att.state_path)
     generated_at = datetime.now(UTC).isoformat()
-    since = _parse_utc(pre_state.last_reviewed)
-    if since is None:
-        since = datetime.now(UTC) - timedelta(hours=24)
+    since = _attention_since(pre_state)
     exclusions = att.exclusions.get("github", []) + att.exclusions.get("launchpad", [])
     state_items = {mid: rec.model_dump() for mid, rec in pre_state.items.items()}
     results, stale = _fetch_attention(providers, since, exclusions, state_items, att.stale_pr_days)
@@ -306,26 +286,26 @@ def digest(config_path_str, open_browser):
     resolved_ids = set().union(*(set(r.get("resolved_ids", [])) for r in results.values()))
 
     with state_lock(att.state_path):
-        # Reload under lock. _load_threaded_state (not load_state) keeps the
-        # merge-layer `provider` key, which merge_into_state's absence
-        # resolution pass needs (`r.get("provider") in ok_providers`); a
-        # plain reload would silently disable resolution for existing items.
-        state = _load_threaded_state(att.state_path)
+        # Reload under lock; load_state alone now round-trips the merge-layer
+        # extras (ItemState carries thread_url/provider).
+        state = load_state(att.state_path)
         ok_providers = {name for name, fetch in results.items() if fetch["ok"]}
-        new_state = merge_into_state(
-            state.model_dump(), merged, ok_providers, generated_at, resolved_ids
+        new_state_obj = AttentionState.model_validate(
+            merge_into_state(state.model_dump(), merged, ok_providers, generated_at, resolved_ids)
         )
-        new_state_obj = _ThreadedState.model_validate(new_state)
         prune(new_state_obj, datetime.now(UTC))
         save_state(att.state_path, new_state_obj)
 
-        # Digest files + symlinks (inside the lock).
+        # Digest files + symlinks (inside the lock), rendered from the PRUNED
+        # state so the saved and rendered views cannot diverge.
         activity_md = generate_report(activity_data)
-        coverage_start = (
-            pre_state.last_reviewed or (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-        )
+        coverage_start = since.isoformat()
         md_text = render_digest_markdown(
-            new_state, activity_md, coverage_start, generated_at, stale + activity_stale
+            new_state_obj.model_dump(),
+            activity_md,
+            coverage_start,
+            generated_at,
+            stale + activity_stale,
         )
         stem = Path(
             str(att.digest_output).replace(
@@ -333,14 +313,14 @@ def digest(config_path_str, open_browser):
             )
         )
         stem.parent.mkdir(parents=True, exist_ok=True)
-        stem.with_suffix(".md").write_text(md_text)
+        _stem_file(stem, "md").write_text(md_text)
         if "html" in att.digest_formats:
-            stem.with_suffix(".html").write_text(render_html(md_text))
+            _stem_file(stem, "html").write_text(render_html(md_text))
         _refresh_symlinks(stem, att.digest_latest, att.digest_formats)
 
     click.echo(strip_front_matter(md_text)[1])
     if open_browser:
-        _open_in_browser(stem.with_suffix(".html" if "html" in att.digest_formats else ".md"))
+        _open_in_browser(_stem_file(stem, "html" if "html" in att.digest_formats else "md"))
 
 
 @cli.command()
@@ -352,11 +332,11 @@ def digest(config_path_str, open_browser):
 @click.option("--open", "open_browser", is_flag=True, default=False)
 def read(config_path_str, open_browser):
     """Mark the newest digest(s) consumed and re-render their status line."""
-    config = load_config(config_path_str)
+    config = _load_config(config_path_str)
     att = config.attention
     now = datetime.now(UTC).isoformat()
     with state_lock(att.state_path):
-        state = _load_threaded_state(att.state_path)
+        state = load_state(att.state_path)
         previous = state.last_reviewed
         newest_ts, targets = _digests_generated_after(att.digest_output, previous)
         if newest_ts is None:
@@ -364,15 +344,18 @@ def read(config_path_str, open_browser):
             return
         record_read(state, newest_ts, now)
         save_state(att.state_path, state)
+        # Spec format, in local time (the stored cursor stays UTC ISO).
+        reviewed_local = datetime.fromisoformat(now).astimezone()
+        stamp = f"Status: Reviewed {reviewed_local:%a %-d %b %H:%M}"
         for path in targets:
             text = path.read_text()
-            stamped = replace_status_line(text, f"Status: Reviewed {now}")
+            stamped = replace_status_line(text, stamp)
             path.write_text(stamped)
             if path.suffix == ".md" and "html" in att.digest_formats:
-                path.with_suffix(".html").write_text(render_html(stamped))
+                _stem_file(path.with_suffix(""), "html").write_text(render_html(stamped))
     if open_browser:
-        suffix = ".html" if "html" in att.digest_formats else ".md"
-        _open_in_browser(att.digest_latest.with_suffix(suffix))
+        ext = "html" if "html" in att.digest_formats else "md"
+        _open_in_browser(_stem_file(att.digest_latest, ext))
 
 
 @cli.command(name="ack")
@@ -385,34 +368,45 @@ def read(config_path_str, open_browser):
 @click.option("--list", "list_items", is_flag=True, default=False)
 def ack(item_id, config_path_str, list_items):
     """Mark item(s) done. ID is an id or substring; --list browses."""
-    config = load_config(config_path_str)
+    config = _load_config(config_path_str)
     att = config.attention
+    # Lock discipline: match + interactive prompt run on a non-mutating
+    # snapshot OUTSIDE the lock, so a prompt never blocks a concurrent
+    # digest/ack; each chosen id is re-checked under the lock before mutating.
+    state = load_state_snapshot(att.state_path)
+    open_items = {mid: r for mid, r in state.items.items() if r.status == "open"}
+    if list_items or item_id is None:
+        _print_items(open_items)
+        return
+    matches = _match_items(open_items, item_id)
+    if not matches:
+        raise click.ClickException(f"No open item matches {item_id!r}")
+    if len(matches) > 1:
+        chosen = _disambiguate(matches)
+        if chosen is None:
+            return
+        matches = [chosen]
+    now = datetime.now(UTC).isoformat()
+    acked = 0
     thread_urls: list[str] = []
     with state_lock(att.state_path):
-        state = _load_threaded_state(att.state_path)
-        open_items = {mid: r for mid, r in state.items.items() if r.status == "open"}
-        if list_items or item_id is None:
-            _print_items(open_items)
-            return
-        matches = _match_items(open_items, item_id)
-        if len(matches) > 1:
-            chosen = _disambiguate(matches)
-            if chosen is None:
-                return
-            matches = [chosen]
-        now = datetime.now(UTC).isoformat()
+        state = load_state(att.state_path)
         for mid in matches:
-            rec = state.items[mid]
+            rec = state.items.get(mid)
+            if rec is None or rec.status != "open":
+                click.echo(f"Skipping {mid}: no longer open.", err=True)
+                continue
             rec.status = "acked"
             rec.acked = True
             rec.acked_at = now
             rec.pinned = False
             if "notification" in rec.origins and rec.thread_url:
                 thread_urls.append(rec.thread_url)  # patched below, outside the lock
+            acked += 1
         save_state(att.state_path, state)
     for url in thread_urls:
         _mark_thread_read(config, url)  # best-effort; network stays outside the lock
-    click.echo(f"Acked {len(matches)} item(s).")
+    click.echo(f"Acked {acked} item(s).")
 
 
 @cli.command()
@@ -424,41 +418,49 @@ def ack(item_id, config_path_str, list_items):
 )
 def unack(item_id, config_path_str):
     """Pull item(s) back into the inbox."""
-    config = load_config(config_path_str)
+    config = _load_config(config_path_str)
     att = config.attention
+    # Same out-of-lock disambiguation flow as `ack`.
+    state = load_state_snapshot(att.state_path)
+    candidates = {mid: r for mid, r in state.items.items() if r.status in ("acked", "resolved")}
+    matches = _match_items(candidates, item_id)
+    if not matches:
+        raise click.ClickException(f"No acked or resolved item matches {item_id!r}")
+    if len(matches) > 1:
+        chosen = _disambiguate(matches, verb="un-ack")
+        if chosen is None:
+            return
+        matches = [chosen]
+    reopened = 0
     with state_lock(att.state_path):
-        state = _load_threaded_state(att.state_path)
-        matches = _match_items(state.items, item_id)
+        state = load_state(att.state_path)
         for mid in matches:
-            rec = state.items[mid]
+            rec = state.items.get(mid)
+            if rec is None or rec.status not in ("acked", "resolved"):
+                click.echo(f"Skipping {mid}: no longer acked/resolved.", err=True)
+                continue
             was_resolved = rec.status == "resolved"
             rec.status = "open"
             rec.acked = False
             rec.acked_at = None
+            rec.resolved_at = None  # un-resolving clears the resolution stamp too
             rec.reopen_count += 1
             if was_resolved:
-                rec.pinned = True
+                rec.pinned = True  # was auto-resolved: pin so it cannot re-resolve
+            reopened += 1
         save_state(att.state_path, state)
-    click.echo(f"Un-acked {len(matches)} item(s).")
+    click.echo(f"Un-acked {reopened} item(s).")
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _parse_utc(ts: str | None) -> datetime | None:
-    """Parse an ISO ts to an aware datetime; None when missing/unparseable.
-
-    A naive ts is treated as UTC (same convention as state.prune); bad stored
-    data degrades the coverage window instead of crashing the digest.
-    """
-    if not ts:
-        return None
-    try:
-        parsed = datetime.fromisoformat(ts)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+def _attention_since(state: AttentionState) -> datetime:
+    """Coverage-window start shared by `attention` and `digest`: the last
+    review cursor, or now-24h on a first run / unparseable cursor."""
+    since = _parse(state.last_reviewed) if state.last_reviewed else None
+    return since or datetime.now(UTC) - timedelta(hours=24)
 
 
 def _open_in_browser(path: Path) -> None:
@@ -466,16 +468,26 @@ def _open_in_browser(path: Path) -> None:
         webbrowser.open(f"file://{path}")
 
 
+def _stem_file(stem: Path, ext: str) -> Path:
+    """`stem.<ext>` — with_suffix would replace everything after the stem's
+    LAST dot, collapsing a dot-containing stem (`daily.report-2026-09-28`)
+    to `daily.md`; appending to the name keeps the full stem intact."""
+    return stem.with_name(stem.name + "." + ext)
+
+
 def _refresh_symlinks(dated_stem: Path, latest_stem: Path, formats: list[str]) -> None:
     """Atomically point latest.<ext> at the newest digest files."""
     for ext in formats:
-        dated = dated_stem.with_suffix(f".{ext}")
-        latest = latest_stem.with_suffix(f".{ext}")
+        dated = _stem_file(dated_stem, ext)
+        latest = _stem_file(latest_stem, ext)
         latest.parent.mkdir(parents=True, exist_ok=True)
         tmp = latest.with_name(latest.name + ".tmp-link")
         if tmp.exists() or tmp.is_symlink():
             tmp.unlink()
-        os.symlink(dated, tmp)
+        # The target must be absolute (or relative to the link's directory):
+        # a bare relative `dated` string would resolve against latest.parent
+        # and dangle.
+        os.symlink(os.path.abspath(dated), tmp)
         os.replace(tmp, latest)
 
 
@@ -500,11 +512,12 @@ def _print_items(items: dict) -> None:
         click.echo(f"{mid}\n    {r.title}  [{', '.join(r.kinds)}]")
 
 
-def _disambiguate(matches: list[str]) -> str | None:
+def _disambiguate(matches: list[str], verb: str = "ack") -> str | None:
+    """Interactive pick among multiple matches; None when cancelled."""
     click.echo("Multiple items match:")
     for i, mid in enumerate(matches, 1):
         click.echo(f"  {i}. {mid}")
-    answer = click.prompt("Number to ack (empty to cancel)", default="", show_default=False)
+    answer = click.prompt(f"Number to {verb} (empty to cancel)", default="", show_default=False)
     if not answer or not answer.isdigit() or not (1 <= int(answer) <= len(matches)):
         return None
     return matches[int(answer) - 1]

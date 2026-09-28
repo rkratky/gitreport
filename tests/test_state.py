@@ -12,6 +12,7 @@ from gitreport.state import (
     AttentionState,
     ItemState,
     load_state,
+    load_state_snapshot,
     prune,
     record_read,
     save_state,
@@ -52,6 +53,61 @@ def test_save_and_load_roundtrip(tmp_path: Path):
     loaded = load_state(path)
     assert loaded.items[item_id].status == "open"
     assert loaded.items[item_id].kinds == ["mention"]
+
+
+def test_item_state_extras_default_none_and_old_files_load(tmp_path: Path):
+    """thread_url/provider live on ItemState; files from before they existed
+    must load with both defaulting to None (and extras round-trip when set)."""
+    _, item = make_item()
+    assert item.thread_url is None
+    assert item.provider is None
+
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"version": 1, "items": {"gh:1": {"status": "open"}}}))
+
+    loaded = load_state(path)
+
+    assert loaded.items["gh:1"].thread_url is None
+    assert loaded.items["gh:1"].provider is None
+
+    state = AttentionState()
+    state.items["gh:1"] = ItemState(status="open", thread_url="https://t/1", provider="github")
+    save_state(path, state)
+    reloaded = load_state(path)
+    assert reloaded.items["gh:1"].thread_url == "https://t/1"
+    assert reloaded.items["gh:1"].provider == "github"
+
+
+def test_load_state_snapshot_is_non_mutating_on_corrupt(tmp_path: Path):
+    """The snapshot read must not rename/backup; load_state still does."""
+    path = tmp_path / "state.json"
+    path.write_text("{not json")
+
+    snapshot = load_state_snapshot(path)
+
+    assert snapshot.items == {}
+    assert snapshot.version == 1
+    assert path.read_text() == "{not json"  # untouched
+    assert not list(tmp_path.glob("state.json.corrupt-*"))
+
+    # The mutating loader keeps its backup-and-rebuild behaviour.
+    rebuilt = load_state(path)
+    assert rebuilt.items == {}
+    assert len(list(tmp_path.glob("state.json.corrupt-*"))) == 1
+    assert not path.exists()  # renamed to the backup
+
+
+def test_load_state_snapshot_returns_saved_state(tmp_path: Path):
+    path = tmp_path / "state.json"
+    state = AttentionState()
+    item_id, item = make_item()
+    state.items[item_id] = item
+    save_state(path, state)
+
+    snapshot = load_state_snapshot(path)
+
+    assert snapshot.items[item_id].status == "open"
+    assert snapshot.last_reviewed == state.last_reviewed
 
 
 def test_corrupt_state_backed_up_and_rebuilt(tmp_path: Path):

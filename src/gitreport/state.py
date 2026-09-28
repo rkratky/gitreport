@@ -30,6 +30,11 @@ class ItemState(BaseModel):
     resolved_at: str | None = None
     pinned: bool = False
     reopen_count: int = 0
+    # Merge-layer extras: attention.merge_into_state emits both keys in its
+    # dict output; declaring them keeps the round-trip (older state files
+    # without these keys load fine — both default to None).
+    thread_url: str | None = None
+    provider: str | None = None
 
 
 class AttentionState(BaseModel):
@@ -85,6 +90,32 @@ def _corrupt_backup_path(path: Path) -> Path:
     return backup
 
 
+def _parse_state(path: Path) -> tuple[AttentionState | None, Exception | None]:
+    """Parse+validate the state file with no side effects.
+
+    Returns (state, error): (state, None) on success, (None, error) when the
+    file is corrupt, (None, None) when it does not exist. Callers decide the
+    failure policy: mutate (backup + rebuild) under the lock, or degrade to
+    an empty state on a non-mutating read.
+    """
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text())
+        return AttentionState.model_validate(data), None
+    except (json.JSONDecodeError, ValueError) as e:
+        return None, e
+
+
+def _warn_on_version(state: AttentionState, path: Path) -> None:
+    if state.version != 1:
+        _warn(
+            f"state file {path} declares version {state.version}, but this release "
+            "writes version 1; it may have been written by another release. "
+            "Loading it as-is; no data is destroyed."
+        )
+
+
 def load_state(path: Path) -> AttentionState:
     """Load the inbox state; missing file -> empty, corrupt -> rebuild.
 
@@ -94,25 +125,32 @@ def load_state(path: Path) -> AttentionState:
 
     Note: the corrupt-file backup rename assumes the caller holds `state_lock`.
     """
-    if not path.exists():
+    state, err = _parse_state(path)
+    if state is None and err is None:
         return AttentionState()
-    try:
-        data = json.loads(path.read_text())
-        state = AttentionState.model_validate(data)
-    except (json.JSONDecodeError, ValueError) as e:
+    if state is None:
         backup = _corrupt_backup_path(path)
         os.replace(path, backup)
         _warn(
-            f"state file {path} was corrupt ({e}); backed up to "
+            f"state file {path} was corrupt ({err}); backed up to "
             f"{backup} and rebuilt empty. Ack/read history is lost."
         )
         return AttentionState()
-    if state.version != 1:
-        _warn(
-            f"state file {path} declares version {state.version}, but this release "
-            "writes version 1; it may have been written by another release. "
-            "Loading it as-is; no data is destroyed."
-        )
+    _warn_on_version(state, path)
+    return state
+
+
+def load_state_snapshot(path: Path) -> AttentionState:
+    """Non-mutating read of the inbox state.
+
+    Same semantics as `load_state` except a corrupt file degrades to an empty
+    state WITHOUT the rename/backup (that mutation assumes the caller holds
+    `state_lock`). Use for reads outside the lock, e.g. pre-lock snapshots.
+    """
+    state, _err = _parse_state(path)
+    if state is None:
+        return AttentionState()  # missing or corrupt: degrade, never touch the file
+    _warn_on_version(state, path)
     return state
 
 
