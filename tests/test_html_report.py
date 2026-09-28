@@ -110,3 +110,21 @@ def test_strip_front_matter_crlf():
     assert meta["generated_at"] == "2026-09-28T06:00:00+00:00"
     assert meta["coverage_start"] == "2026-09-27T06:00:00+00:00"
     assert body.startswith("\r\n# GitReport digest")
+
+
+def test_strip_front_matter_value_with_dashes():
+    # N-01: the closing fence must be line-anchored — a front-matter VALUE
+    # containing `---` must not terminate the block mid-line; the value must
+    # survive intact and the real closing fence must still be found.
+    md = "---\na: x---y\n---\n\nbody\n"
+    meta, body = strip_front_matter(md)
+    assert meta["a"] == "x---y"
+    assert body.startswith("\nbody\n")
+
+
+def test_render_html_preserves_literal_title_in_prose():
+    # N-02: the title-attribute strip must only touch attributes inside <a>
+    # tags — literal `title="hi"` in prose must survive rendering untouched.
+    md = MD.replace("[T](https://github.com/o/r/pull/1)", 'see the title="hi" note')
+    html = render_html(md)
+    assert 'title="hi"' in html

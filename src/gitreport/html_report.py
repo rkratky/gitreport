@@ -41,13 +41,18 @@ _IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 # reporting.py, so this is a second line of defence, not the primary guard.
 _UNSAFE_HREF_RE = re.compile(r'href="(?!(?:https?)://)[^"]*"', re.IGNORECASE)
 # markdown renders `[a](url "title")` with a title="..." attribute; the title
-# text is user-supplied and must never sit in an attribute value.
-_LINK_TITLE_ATTR_RE = re.compile(r'\s+title="[^"]*"')
+# text is user-supplied and must never sit in an attribute value. The strip is
+# scoped to attributes inside <a> tags only, so literal `title="..."` in prose
+# survives rendering.
+_LINK_TITLE_ATTR_RE = re.compile(r'(<a\b[^>]*?)\s+title="[^"]*"')
 
 
 def strip_front_matter(md_text: str) -> tuple[dict, str]:
     """Split `---`-fenced front matter from the Markdown body."""
-    match = re.match(r"\A---\r?\n(.*?)\r?\n?---\r?\n", md_text, re.DOTALL)
+    # The closing fence must be line-anchored: a front-matter VALUE may
+    # itself contain `---` (e.g. `a: x---y`) and must not terminate the
+    # block mid-line.
+    match = re.match(r"\A---\r?\n(?:(.*?)\r?\n)?---\r?\n", md_text, re.DOTALL)
     if not match:
         return {}, md_text
     meta: dict = {}
@@ -101,5 +106,5 @@ def render_html(md_text: str, title: str = "GitReport digest") -> str:
     rendered = markdown.markdown(safe_body, output_format="html")
     rendered = _IMG_TAG_RE.sub("", rendered)
     rendered = _UNSAFE_HREF_RE.sub('href="#"', rendered)
-    rendered = _LINK_TITLE_ATTR_RE.sub("", rendered)
+    rendered = _LINK_TITLE_ATTR_RE.sub(r"\1", rendered)
     return _TEMPLATE.format(title=html.escape(title), body=rendered)
