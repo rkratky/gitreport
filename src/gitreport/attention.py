@@ -1,0 +1,270 @@
+"""Merge provider attention results with state; render the digest."""
+
+import copy
+from datetime import UTC, datetime, timedelta
+
+PRUNE_AFTER = timedelta(days=30)
+MAX_REASONS = 10
+BUCKETS = ("today", "week", "older")
+BUCKET_TITLES = {"today": "Today", "week": "Last 7 days", "older": "Older than 7 days"}
+
+
+def _is_later(a: str | None, b: str | None) -> bool:
+    if a is None:
+        return False
+    if b is None:
+        return True
+    return a > b
+
+
+def dedupe(results: dict[str, dict]) -> dict[str, dict]:
+    """Union per-origin provider items into merged items keyed by id."""
+    merged: dict[str, dict] = {}
+    for provider, result in results.items():
+        for item in result.get("items", []):
+            mid = item["id"]
+            m = merged.setdefault(
+                mid,
+                {
+                    "id": mid,
+                    "provider": item.get("provider", provider),
+                    "origins": set(),
+                    "kinds": set(),
+                    "reasons": [],
+                    "repo": item.get("repo", ""),
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "updated_at": item.get("updated_at"),
+                    "thread_url": item.get("thread_url"),
+                },
+            )
+            if item.get("origin"):
+                m["origins"].add(item["origin"])
+            if item.get("kind"):
+                m["kinds"].add(item["kind"])
+            reason = item.get("reason")
+            if reason and reason not in m["reasons"]:
+                m["reasons"].append(reason)
+            if item.get("thread_url"):
+                m["thread_url"] = item["thread_url"]
+            if _is_later(item.get("updated_at"), m["updated_at"]):
+                m["updated_at"] = item["updated_at"]
+                m["repo"] = item.get("repo", m["repo"])
+                m["title"] = item.get("title", m["title"])
+                m["url"] = item.get("url", m["url"])
+    for m in merged.values():
+        m["origins"] = sorted(m["origins"])
+        m["kinds"] = sorted(m["kinds"])
+        m["reasons"] = m["reasons"][:MAX_REASONS]
+    return merged
+
+
+def merge_into_state(
+    state: dict,
+    merged_items: dict[str, dict],
+    ok_providers: set[str],
+    generated_at: str,
+    resolved_ids: set[str] | frozenset[str] = frozenset(),
+) -> dict:
+    """Pure: apply enters/reopens/resolutions/prune; return the new state."""
+    st = copy.deepcopy(state)
+    items = st["items"]
+
+    # 1. Enter / reopen / refresh, from the fetched items.
+    for mid, m in merged_items.items():
+        r = items.get(mid)
+        if r is None:
+            items[mid] = {
+                "status": "open",
+                "origins": m["origins"],
+                "kinds": m["kinds"],
+                "reasons": m["reasons"],
+                "repo": m["repo"],
+                "title": m["title"],
+                "url": m["url"],
+                "first_seen": generated_at,
+                "last_updated": m["updated_at"] or generated_at,
+                "acked": False,
+                "acked_at": None,
+                "resolved_at": None,
+                "pinned": False,
+                "reopen_count": 0,
+                "thread_url": m.get("thread_url"),
+                "provider": m["provider"],
+            }
+            continue
+        new_event = _is_later(m["updated_at"], r.get("last_updated"))
+        for key in ("origins", "kinds"):
+            r[key] = sorted(set(r[key]) | set(m[key]))
+        for reason in m["reasons"]:
+            if reason not in r["reasons"]:
+                r["reasons"].append(reason)
+        r["reasons"] = r["reasons"][:MAX_REASONS]
+        r["resolved_at"] = None  # a source reports it again
+        if m.get("thread_url"):
+            r["thread_url"] = m["thread_url"]
+        if new_event:
+            r["repo"], r["title"], r["url"] = m["repo"], m["title"], m["url"]
+            if r.get("pinned"):
+                pass  # pinned: refresh display only; stays open
+            elif r["status"] == "open":
+                r["last_updated"] = m["updated_at"]
+            elif r["status"] in ("acked", "resolved"):
+                r.update(
+                    status="open",
+                    acked=False,
+                    acked_at=None,
+                    resolved_at=None,
+                    reopen_count=r.get("reopen_count", 0) + 1,
+                    last_updated=m["updated_at"],
+                )
+
+    # 2. Resolution pass — absence-based, only for fully-fetched providers.
+    for mid, r in items.items():
+        if r.get("pinned") or mid in merged_items:
+            continue  # still reported, or pinned: never auto-resolve
+        if r.get("provider") in ok_providers or mid in resolved_ids:
+            if r["status"] == "open":
+                r["status"] = "resolved"
+                r["resolved_at"] = generated_at
+            elif r["status"] == "acked" and r.get("resolved_at") is None:
+                r["resolved_at"] = generated_at
+
+    # 3. Retention prune.
+    gen = datetime.fromisoformat(generated_at)
+    for mid in list(items):
+        r = items[mid]
+        if r["status"] not in ("acked", "resolved") or r.get("resolved_at") is None:
+            continue
+        resolved = datetime.fromisoformat(r["resolved_at"])
+        if resolved.tzinfo is None:
+            resolved = resolved.replace(tzinfo=UTC)
+        if (gen - resolved) >= PRUNE_AFTER:
+            del items[mid]
+
+    st["last_digest_run"] = generated_at
+    return st
+
+
+def build_report(state: dict, now: datetime) -> dict:
+    """Split open items into New and Still open (today / week / older)."""
+    last_reviewed = state.get("last_reviewed")
+    new_items: list[dict] = []
+    still_open: list[dict] = []
+    for mid, r in sorted(state["items"].items()):
+        if r.get("status") != "open":
+            continue
+        is_new = not last_reviewed or (r.get("first_seen") or "") > last_reviewed
+        entry = {
+            "id": mid,
+            "repo": r.get("repo", ""),
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "reasons": r.get("reasons", []),
+            "last_updated": r.get("last_updated", ""),
+            "reopen_count": r.get("reopen_count", 0),
+        }
+        (new_items if is_new else still_open).append(entry)
+
+    buckets: dict[str, list[dict]] = {b: [] for b in BUCKETS}
+    now_local = now.astimezone()
+    for entry in still_open:
+        lu = entry["last_updated"]
+        when = datetime.fromisoformat(lu).astimezone() if lu else None
+        if when is None or when.date() == now_local.date():
+            bucket = "today"
+        elif when >= now_local - timedelta(days=7):
+            bucket = "week"
+        else:
+            bucket = "older"
+        buckets[bucket].append(entry)
+
+    new_items.sort(key=lambda e: e["last_updated"] or "", reverse=True)
+    return {"new": new_items, **buckets}
+
+
+def _fmt_local(ts: str) -> str:
+    dt = datetime.fromisoformat(ts).astimezone()
+    return f"{dt:%a} {dt.day} {dt:%b}"
+
+
+def _entry_line(entry: dict) -> str:
+    title = entry.get("title") or entry["id"]
+    url = entry.get("url", "")
+    if url.startswith(("http://", "https://")):
+        line = f"- [{title}]({url})"
+    else:
+        line = f"- {title}"
+    if entry.get("reopen_count"):
+        line += " (re-opened)"
+    for reason in entry.get("reasons", []):
+        line += f"\n  - {reason}"
+    return line
+
+
+def render_attention_body(report: dict, stale_providers: list[str]) -> str:
+    lines: list[str] = []
+    if report["new"]:
+        lines += ["### New since last review", ""]
+        lines += [_entry_line(e) for e in report["new"]]
+        lines.append("")
+    for bucket in BUCKETS:
+        entries = report[bucket]
+        if not entries:
+            continue
+        lines += [f"### Still open — {BUCKET_TITLES[bucket]}", ""]
+        lines += [_entry_line(e) for e in entries]
+        lines.append("")
+    if not report["new"] and not any(report[b] for b in BUCKETS):
+        lines += ["_Nothing needs your attention._", ""]
+    if stale_providers:
+        names = ", ".join(sorted(stale_providers))
+        lines += [
+            f"Warning: these providers failed to fetch; their sections may be stale: {names}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def render_attention_stdout(state: dict, stale_providers: list[str], now: datetime) -> str:
+    """Dry-run attention view (no state machinery, no front matter)."""
+    report = build_report(state, now)
+    return "# Needs attention\n\n" + render_attention_body(report, stale_providers)
+
+
+def render_digest_markdown(
+    state: dict,
+    activity_markdown: str,
+    coverage_start: str,
+    generated_at: str,
+    stale_providers: list[str],
+) -> str:
+    start_dt = datetime.fromisoformat(coverage_start)
+    end_dt = datetime.fromisoformat(generated_at)
+    days = max(1, (end_dt - start_dt).days)
+    unit = "day" if days == 1 else "days"
+    coverage = (
+        f"Coverage: {_fmt_local(coverage_start)} – {_fmt_local(generated_at)} "
+        f"({days} {unit} since last review)"
+    )
+    report = build_report(state, end_dt)
+    lines = [
+        "---",
+        f"generated_at: {generated_at}",
+        f"coverage_start: {coverage_start}",
+        "---",
+        "",
+        "# GitReport digest",
+        "",
+        coverage,
+        "Status: NOT YET REVIEWED — run `gitreport read` after reviewing",
+        "",
+        "## Needs attention",
+        "",
+        render_attention_body(report, stale_providers),
+        "## Recent activity",
+        "",
+        activity_markdown.strip() or "_No activity in the coverage window._",
+        "",
+    ]
+    return "\n".join(lines)
