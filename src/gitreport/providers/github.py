@@ -1,3 +1,5 @@
+import re
+import sys
 from datetime import UTC, datetime, timedelta
 
 from github import Auth, Github, GithubRetry
@@ -28,7 +30,7 @@ query($q: String!, $cursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes { ... on PullRequest {
       url title updatedAt
-      reviewThreads(first: 100) { nodes { isResolved } }
+      reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved } }
     } }
   }
 }
@@ -192,14 +194,16 @@ class GitHubProvider:
         for n in self._github.get_user().get_notifications(all=False):
             subject_url = getattr(n.subject, "url", "") or ""
             thread_url = getattr(n, "url", "") or ""
-            # Derive repo full name from the subject API url:
-            # https://api.github.com/repos/OWNER/REPO/pulls/3
-            parts = subject_url.split("/repos/")
-            full_name = (
-                parts[1].rsplit("/", 1)[0]
-                if len(parts) == 2
-                else (n.repository.full_name if n.repository else "")
-            )
+            subject_type = getattr(n.subject, "type", "") or ""
+            repository = getattr(n, "repository", None)
+            if repository is not None:
+                full_name = repository.full_name
+            else:
+                # Fallback: parse the repo from the subject API url, stripping
+                # the trailing "/<type>/<number>" segments:
+                # api.github.com/repos/org/repo/pulls/1 -> "org/repo".
+                match = re.search(r"/repos/(.+)/[^/]+/[^/]+$", subject_url)
+                full_name = match.group(1) if match else ""
             if is_excluded(full_name, exclusions):
                 continue
             reason = n.reason
@@ -212,18 +216,24 @@ class GitHubProvider:
                 if kind is None:
                     continue  # subscribed, state_change, manual, etc.
             title = getattr(n.subject, "title", "") or ""
-            # Convert the subject API url to its html url for display:
-            # api.github.com/repos/o/r/pulls/3 -> github.com/o/r/pull/3
-            html_url = (
-                subject_url.replace("api.github.com/repos/", "github.com/")
-                .replace("/pulls/", "/pull/")
-                .replace("/issues/", "/issues/")
-                if subject_url
-                else ""
-            )
+            if subject_type in ("PullRequest", "Issue") and subject_url:
+                # Convert the subject API url to its html url for display:
+                # api.github.com/repos/o/r/pulls/3 -> github.com/o/r/pull/3
+                # api.github.com/repos/o/r/commits/<sha> -> github.com/o/r/commit/<sha>
+                html_url = (
+                    subject_url.replace("api.github.com/repos/", "github.com/")
+                    .replace("/pulls/", "/pull/")
+                    .replace("/commits/", "/commit/")
+                )
+            else:
+                # Other subject types (releases, discussions, ...) have no
+                # predictable api->html rewrite; show the thread url instead.
+                html_url = thread_url
             items.append(
                 self._item(
-                    mid=f"gh:{subject_url or thread_url}",
+                    # Ids use the html url form so query/GraphQL-origin items
+                    # for the same PR dedupe against notification items.
+                    mid=f"gh:{html_url or thread_url}",
                     provider="github",
                     kind=kind,
                     origin="notification",
@@ -238,7 +248,13 @@ class GitHubProvider:
         return items
 
     def _ci_failed(self, full_name: str, subject_url: str) -> bool:
-        """True when the subject's check runs contain a failure."""
+        """True when the subject's check runs contain a failure.
+
+        v1 limitation: GitHub sends ci_activity notifications with a
+        CheckSuite subject and null url; those are skipped here — failing
+        checks on the user's own PRs are still caught by the status:failure
+        search query.
+        """
         try:
             number = int(subject_url.rsplit("/", 1)[1])
             repo = self._github.get_repo(full_name)
@@ -279,7 +295,17 @@ class GitHubProvider:
             )
             search = payload["data"]["search"]
             for node in search["nodes"]:
-                threads = node.get("reviewThreads", {}).get("nodes", [])
+                thread_data = node.get("reviewThreads", {})
+                if thread_data.get("pageInfo", {}).get("hasNextPage"):
+                    # Truncated threads: item dropped rather than risk false
+                    # resolution (we cannot see threads beyond the first 100).
+                    print(
+                        f"Warning: {node.get('url')} has more than 100 review "
+                        "threads; skipping its unresolved-thread item.",
+                        file=sys.stderr,
+                    )
+                    continue
+                threads = thread_data.get("nodes", [])
                 if not any(not t.get("isResolved") for t in threads):
                     continue
                 repo_full = (
@@ -321,8 +347,8 @@ class GitHubProvider:
             items: list[AttentionItem] = []
             items.extend(self._notification_items(exclusions))
 
-            date_q = f"is:pr is:open author:{self._username} status:failure"
-            for issue in self._github.search_issues(date_q):
+            failing_checks_q = f"is:pr is:open author:{self._username} status:failure"
+            for issue in self._github.search_issues(failing_checks_q):
                 got = self._search_item(issue, "ci_failure", "check failure", exclusions)
                 if got:
                     items.append(got)

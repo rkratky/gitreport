@@ -190,11 +190,13 @@ class MockNotification:
         subject_url="https://api.github.com/repos/org/repo/pulls/1",
         thread_url="https://api.github.com/notifications/threads/1",
         updated_at=None,
+        subject_type="PullRequest",
     ):
         self.reason = reason
         self.url = thread_url
         self.updated_at = updated_at or datetime(2026, 9, 28, tzinfo=UTC)
-        self.subject = type("S", (), {"title": title, "url": subject_url})()
+        self.subject = type("S", (), {"title": title, "url": subject_url, "type": subject_type})()
+        self.repository = MockRepository(repo)
 
 
 class MockCheckRun:
@@ -229,7 +231,7 @@ def _notification_mock(reason, repo="org/repo"):
     # repo="me/fork-x" cases pass a full name; derive the subject url from it.
     subject_url = f"https://api.github.com/repos/{repo}/pulls/1"
     thread_url = "https://api.github.com/notifications/threads/1"
-    return MockNotification(reason, subject_url=subject_url, thread_url=thread_url)
+    return MockNotification(reason, repo=repo, subject_url=subject_url, thread_url=thread_url)
 
 
 def test_github_notification_reason_kinds():
@@ -264,12 +266,90 @@ def test_github_ci_activity_only_on_failure():
     fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
     assert len(fetch["items"]) == 1
     assert fetch["items"][0]["kind"] == "ci_failure"
+    # The check-run lookup must target the repo derived from the notification.
+    provider._github.get_repo.assert_called_with("org/repo")
 
 
 def test_github_exclusion_globs():
     provider = _provider_with_notifications([_notification_mock("mention", repo="me/fork-x")])
     fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), exclusions=["me/fork-*"])
     assert fetch["items"] == []
+
+
+def test_github_notification_repo_full_name_from_repository():
+    """The repo name comes from the notification's repository, not the subject url."""
+    provider = _provider_with_notifications([_notification_mock("mention")])
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert [i["repo"] for i in fetch["items"]] == ["org/repo"]
+
+
+def test_github_notification_exact_repo_exclusion_drops_item():
+    provider = _provider_with_notifications([_notification_mock("mention")])
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), exclusions=["org/repo"])
+    assert fetch["items"] == []
+
+
+def test_github_notification_other_glob_keeps_item():
+    provider = _provider_with_notifications([_notification_mock("mention")])
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC), exclusions=["other/*"])
+    assert len(fetch["items"]) == 1
+
+
+def test_github_notification_and_graphql_share_id():
+    """A notification (api url) and a GraphQL node (html url) for the same PR
+    must produce the same dedupe id."""
+    notification = MockNotification(
+        "mention",
+        repo="o/r",
+        subject_url="https://api.github.com/repos/o/r/pulls/5",
+        thread_url="https://api.github.com/notifications/threads/5",
+    )
+    provider = _provider_with_notifications([notification])
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    notification_id = fetch["items"][0]["id"]
+
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = []
+        instance.search_issues.return_value = []
+        graphql_payload = {
+            "data": {
+                "search": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "url": "https://github.com/o/r/pull/5",
+                            "title": "PR 5",
+                            "updatedAt": "2026-09-27T10:00:00Z",
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"isResolved": False}],
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+        instance.requester.graphql_query.return_value = (graphql_payload, ())
+        thread_provider = GitHubProvider(username="testuser", token="fake-token")
+        thread_provider._github = instance
+        thread_fetch = thread_provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+
+    assert notification_id == "gh:https://github.com/o/r/pull/5"
+    assert thread_fetch["items"][0]["id"] == notification_id
+
+
+def test_github_notification_release_subject_falls_back_to_thread_url():
+    """Non PR/Issue subjects (releases, ...) render the thread url as display url."""
+    notification = MockNotification(
+        "comment",
+        subject_url="https://api.github.com/repos/org/repo/releases/99",
+        thread_url="https://api.github.com/notifications/threads/1",
+        subject_type="Release",
+    )
+    provider = _provider_with_notifications([notification])
+    fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+    assert fetch["items"][0]["url"] == "https://api.github.com/notifications/threads/1"
 
 
 def test_github_query_items_kinds():
@@ -336,7 +416,8 @@ def test_github_thread_unresolved_via_graphql():
                             "title": "PR with threads",
                             "updatedAt": "2026-09-27T10:00:00Z",
                             "reviewThreads": {
-                                "nodes": [{"isResolved": True}, {"isResolved": False}]
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"isResolved": True}, {"isResolved": False}],
                             },
                         }
                     ],
@@ -353,6 +434,40 @@ def test_github_thread_unresolved_via_graphql():
     assert fetch["items"][0]["id"] == "gh:https://github.com/o/r/pull/5"
 
 
+def test_github_truncated_review_threads_skip_item(capsys):
+    """A PR with more review threads than the query fetches is skipped entirely."""
+    with patch("gitreport.providers.github.Github") as mock_github_cls:
+        instance = mock_github_cls.return_value
+        instance.get_user.return_value.get_notifications.return_value = []
+        instance.search_issues.return_value = []
+        truncated = {
+            "data": {
+                "search": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "url": "https://github.com/o/r/pull/7",
+                            "title": "Too many threads",
+                            "updatedAt": "2026-09-27T10:00:00Z",
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": True},
+                                "nodes": [{"isResolved": False}],
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+        instance.requester.graphql_query.return_value = (truncated, ())
+        provider = GitHubProvider(username="testuser", token="fake-token")
+        provider._github = instance
+        fetch = provider.get_attention(datetime(2026, 9, 28, tzinfo=UTC))
+
+    assert fetch["ok"] is True
+    assert fetch["items"] == []  # truncated threads: item dropped
+    assert "more than 100 review threads" in capsys.readouterr().err
+
+
 def test_github_thread_pagination_uses_end_cursor():
     with patch("gitreport.providers.github.Github") as mock_github_cls:
         instance = mock_github_cls.return_value
@@ -367,7 +482,10 @@ def test_github_thread_pagination_uses_end_cursor():
                             "url": "https://github.com/o/r/pull/5",
                             "title": "Page one PR",
                             "updatedAt": "2026-09-27T10:00:00Z",
-                            "reviewThreads": {"nodes": [{"isResolved": False}]},
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"isResolved": False}],
+                            },
                         }
                     ],
                 }
