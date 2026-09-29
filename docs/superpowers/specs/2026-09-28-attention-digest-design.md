@@ -304,10 +304,14 @@ missed period:
   standard format. New items are ordered by `last_updated`, newest first,
   so the most recent catch-up items read first.
 - **Scheduling**: a systemd timer with `Persistent=true` fires shortly after
-  boot/resume if the schedule elapsed while the machine was off, so the
-  catch-up digest is typically ready the morning you return. Plain cron
-  simply runs at the next scheduled time. Either way, coverage is identical
-  because windows are state-anchored.
+  boot if the schedule elapsed while the machine was off, so the catch-up
+  digest is typically ready the morning you return. Wake-from-suspend is
+  covered by a system-level resume unit (`WantedBy=suspend.target`,
+  `After=suspend.target`) running `gitreport digest --catch-up`, which
+  no-ops when today's digest already exists — one digest per local day
+  regardless of how often the machine resumes. Plain cron simply runs at
+  the next scheduled time (`@reboot` + `--catch-up` covers boot). Either
+  way, coverage is identical because windows are state-anchored.
 - **Caveat**: GitHub expires unread notifications after ~3 months. An
   absence longer than that can lose notification-derived items (mention,
   comment, review-request threads). Query-derived items (assigned issues,
@@ -416,9 +420,12 @@ attention:
   state** (safe dry-run view; items not yet in state show as New).
 - `gitreport digest` — the morning run: attention + activity since
   `last_reviewed`; updates state (`last_digest_run`, first-seen marking,
-  reopens, resolutions, prune); writes the dated `.md` (and `.html` if
-  enabled) and refreshes the `latest.*` symlinks; prints Markdown to stdout.
+  resolutions, prune); writes the dated `.html`/`.md` digest and refreshes
+  the `latest.html`/`latest.md` symlinks; prints Markdown to stdout.
   `--open` opens the digest in a browser. Does not advance `last_reviewed`.
+  `--catch-up` runs only when no digest has been generated today (local
+  date) — for start-up/resume hooks that fire alongside the scheduled run,
+  so a late start still produces the report without per-resume API spam.
 - `gitreport read [--open]` — mark reports consumed: sets `last_reviewed` to
   the newest digest's generation timestamp and `reviewed_at = now`,
   re-renders the status line of every digest generated after the previous

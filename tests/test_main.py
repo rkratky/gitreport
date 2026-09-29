@@ -1051,3 +1051,106 @@ def test_commands_fail_cleanly_on_bad_config(mock_load_config, argv):
     result = CliRunner().invoke(cli, argv)
 
     _assert_clean_cli_error(result, "Configuration file not found.")
+
+
+# --- digest --catch-up (start-up / resume hooks) ---
+
+
+def _seed_state(state_path, last_digest_run):
+    from gitreport.state import AttentionState, save_state
+
+    save_state(state_path, AttentionState(last_digest_run=last_digest_run))
+
+
+def _reset_noop():
+    NoopProvider.get_attention.reset_mock()
+    NoopProvider.get_activity.reset_mock()
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_catch_up_skips_when_ran_today(mock_load_config, tmp_path_factory):
+    """A digest generated today (local date) means --catch-up is a no-op."""
+    from datetime import UTC
+
+    tmp = tmp_path_factory.mktemp("catchup-skip")
+    state_path = tmp / "state.json"
+    _seed_state(state_path, datetime.now(UTC).isoformat())
+    mock_load_config.return_value = _config_with(
+        state_path=state_path,
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+    _reset_noop()
+
+    result = CliRunner().invoke(cli, ["digest", "--catch-up"])
+
+    assert result.exit_code == 0, result.output
+    assert "skipping" in result.output.lower()
+    assert NoopProvider.get_attention.call_count == 0
+    assert NoopProvider.get_activity.call_count == 0
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_catch_up_runs_when_last_run_was_yesterday(mock_load_config, tmp_path_factory):
+    """No digest today (local date) -> --catch-up does a full run."""
+    from datetime import UTC, timedelta
+
+    tmp = tmp_path_factory.mktemp("catchup-run")
+    state_path = tmp / "state.json"
+    _seed_state(state_path, (datetime.now(UTC) - timedelta(days=1)).isoformat())
+    mock_load_config.return_value = _config_with(
+        state_path=state_path,
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+    _reset_noop()
+
+    result = CliRunner().invoke(cli, ["digest", "--catch-up"])
+
+    assert result.exit_code == 0, result.output
+    assert NoopProvider.get_attention.call_count == 1
+    assert NoopProvider.get_activity.call_count == 1
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_catch_up_runs_on_first_ever(mock_load_config, tmp_path_factory):
+    """Unset last_digest_run -> --catch-up runs (first morning)."""
+    tmp = tmp_path_factory.mktemp("catchup-first")
+    state_path = tmp / "state.json"
+    _seed_state(state_path, None)
+    mock_load_config.return_value = _config_with(
+        state_path=state_path,
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+    _reset_noop()
+
+    result = CliRunner().invoke(cli, ["digest", "--catch-up"])
+
+    assert result.exit_code == 0, result.output
+    assert NoopProvider.get_attention.call_count == 1
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_without_catch_up_always_runs(mock_load_config, tmp_path_factory):
+    """Plain digest ignores the gate (the scheduled timer must always run)."""
+    from datetime import UTC
+
+    tmp = tmp_path_factory.mktemp("catchup-plain")
+    state_path = tmp / "state.json"
+    _seed_state(state_path, datetime.now(UTC).isoformat())
+    mock_load_config.return_value = _config_with(
+        state_path=state_path,
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+    _reset_noop()
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert NoopProvider.get_attention.call_count == 1

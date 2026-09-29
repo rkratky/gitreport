@@ -270,10 +270,23 @@ def attention(config_path_str):
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
 @click.option("--open", "open_browser", is_flag=True, default=False)
-def digest(config_path_str, open_browser):
+@click.option(
+    "--catch-up",
+    is_flag=True,
+    default=False,
+    help=(
+        "Run only if no digest has been generated today (local date). "
+        "Intended for start-up/resume hooks that fire alongside the "
+        "scheduled run."
+    ),
+)
+def digest(config_path_str, open_browser, catch_up):
     """Morning run: attention + activity; writes the digest; updates state."""
     config = _load_config(config_path_str)
     att = config.attention
+    if catch_up and _digest_ran_today(att.state_path):
+        click.echo("Digest already generated today; skipping (--catch-up).", err=True)
+        return
     providers = _build_providers(config)
 
     # Snapshot for fetches (outside the lock; non-mutating read).
@@ -509,6 +522,21 @@ def _attention_since(state: AttentionState) -> datetime:
     review cursor, or now-24h on a first run / unparseable cursor."""
     since = _parse(state.last_reviewed) if state.last_reviewed else None
     return since or datetime.now(UTC) - timedelta(hours=24)
+
+
+def _digest_ran_today(state_path: Path) -> bool:
+    """True when the last digest ran on today's LOCAL date (catch-up gate).
+
+    Reads state non-mutatingly (no lock needed: a stale racing answer just
+    causes one redundant or skipped catch-up run, never data damage).
+    """
+    state = load_state_snapshot(state_path)
+    if not state.last_digest_run:
+        return False
+    ran_at = _parse(state.last_digest_run)
+    if ran_at is None:
+        return False
+    return ran_at.astimezone().date() == datetime.now().astimezone().date()
 
 
 def _open_in_browser(path: Path) -> None:

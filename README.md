@@ -262,18 +262,61 @@ path in `ExecStart` — `poetry env info --path` prints it (with in-project
 virtualenvs it is `<repo>/.venv`). The entrypoint is called directly from the
 venv's `bin/`; no `poetry run` wrapper is needed.
 
-`Persistent=true` makes the timer fire shortly after boot/resume if the
-schedule elapsed while the machine was off, so the catch-up digest is
-typically ready the morning you return.
+`Persistent=true` makes the timer fire shortly after boot if the schedule
+elapsed while the machine was off, so the catch-up digest is typically ready
+the morning you return.
+
+### Late starts: run at boot/wake-up even if it's past the schedule
+
+The timer covers "machine was off at 07:30 and booted at 09:00".
+Wake-from-suspend is handled by a resume hook plus `digest --catch-up`,
+which runs a full digest only when none has been generated yet today (local
+date) — so suspending and resuming repeatedly never spams API calls, and a
+late start still produces the report:
+
+```bash
+gitreport digest --catch-up   # skips silently if today's digest already ran
+```
+
+Add a system-level resume unit (sudo, once):
+
+```ini
+# /etc/systemd/system/gitreport-resume.service
+[Unit]
+Description=GitReport digest catch-up on resume from suspend
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+User=yourusername
+Environment=HOME=/home/yourusername
+ExecStart=/home/yourusername/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest --catch-up
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable gitreport-resume.service
+```
+
+A unit with `WantedBy=suspend.target` and `After=suspend.target` starts when
+the machine resumes (the target is re-reached after sleep), covering both
+wake-from-suspend and boot for laptops. `--catch-up` gates it to one digest
+per day; the scheduled timer keeps using plain `digest` and always runs.
 
 ### cron equivalent
 
 ```cron
 30 7 * * * $HOME/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest
+@reboot        $HOME/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest --catch-up
 ```
 
 Plain cron simply runs at the next scheduled time; coverage is identical
-either way because windows are state-anchored.
+either way because windows are state-anchored. The `@reboot` line covers
+late-start boots; cron has no suspend/resume hook — on laptops use the
+systemd timer + resume unit instead.
 
 ### Caveats
 
