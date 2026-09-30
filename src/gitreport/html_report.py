@@ -503,14 +503,19 @@ _DASH_JS = r"""(function () {
 
   // Row matches one chip dimension: OR within the dimension's selected
   // values, an empty selection matching every row. Shared by the row filter
-  // and the KPI counters; "type" is the space-joined badge key list, age and
-  // repo are single attribute values.
+  // and the KPI counters. "type" (badge keys) and "kinds" (raw item kinds,
+  // the Assigned KPI's pseudo-dimension) are space-joined attribute lists;
+  // age and repo are single attribute values.
   function matchesDimension(row, dimension, values) {
     if (Object.keys(values).length === 0) {
       return true;
     }
-    if (dimension === "type") {
-      return (row.getAttribute("data-type") || "")
+    if (dimension === "type" || dimension === "kinds") {
+      var list =
+        dimension === "type"
+          ? row.getAttribute("data-type") || ""
+          : row.getAttribute("data-kinds") || "";
+      return list
         .split(/\s+/)
         .some(function (key) {
           return key !== "" && values[key];
@@ -558,15 +563,30 @@ _DASH_JS = r"""(function () {
   }
 
   // KPI cards double as filter shortcuts (spec mapping): each toggles its
-  // chip set as a group — all on when not all were on, all off otherwise.
-  // The same mapping is the single source of truth for the live counts:
-  // each card shows the number of visible rows matching its own filter
-  // (OR within a dimension, AND across dimensions — the chip rule). With no
-  // filters active the recomputed counts equal the rendered ones.
+  // chip set as a group — all on when not all were on, all off otherwise
+  // (KPI_CHIPS below). The KPI_FILTERS mapping is the single source of truth
+  // for the live counts: each card shows the number of visible rows matching
+  // its own filter (OR within a dimension, AND across dimensions — the chip
+  // rule). With no filters active the recomputed counts equal the rendered
+  // ones. Assigned counts the kinds pseudo-dimension: the server-side KPI
+  // (attention.py) counts "issue_assigned" kinds, and the type badge alone
+  // would miss LP rows that badge as "bug".
   var KPI_FILTERS = {
     new: [["age", "new"]],
     still_open: [["age", "today"], ["age", "week"], ["age", "month"], ["age", "older"]],
-    assigned: [["type", "issue"]],
+    assigned: [["kinds", "issue_assigned"]],
+    ci_failing: [["type", "ci"]],
+    stale_prs: [["type", "stale"]],
+  };
+
+  // Chip sets toggled when a KPI card is clicked (spec mapping). Assigned
+  // counts kinds, not type badges — an LP issue_assigned row badges as
+  // "bug" — so its click toggles the issue AND bug type chips together to
+  // include LP bugs in the filtered view (kinds have no chip of their own).
+  var KPI_CHIPS = {
+    new: [["age", "new"]],
+    still_open: [["age", "today"], ["age", "week"], ["age", "month"], ["age", "older"]],
+    assigned: [["type", "issue"], ["type", "bug"]],
     ci_failing: [["type", "ci"]],
     stale_prs: [["type", "stale"]],
   };
@@ -619,7 +639,7 @@ _DASH_JS = r"""(function () {
       card.setAttribute("role", "button");
       card.setAttribute("tabindex", "0");
       var activate = function () {
-        var mapped = (KPI_FILTERS[card.getAttribute("data-kpi")] || [])
+        var mapped = (KPI_CHIPS[card.getAttribute("data-kpi")] || [])
           .map(function (spec) {
             return findChip(spec[0], spec[1]);
           })
@@ -812,10 +832,13 @@ def _attention_items(model: dict) -> list[dict]:
 def _render_item(entry: dict, bucket: str) -> str:
     """One .gr-item row: title link, badge pills, age, re-opened marker and
     muted reasons. The data-* attributes are the Task 6 filter/search
-    contract: data-type (space-joined badge keys), data-age, data-repo and
-    data-text (title + repo + reasons, all escaped)."""
+    contract: data-type (space-joined badge keys), data-kinds (space-joined
+    raw kinds — the Assigned KPI's pseudo-dimension, immune to the LP bug
+    badge override), data-age, data-repo and data-text (title + repo +
+    reasons, all escaped)."""
     repo = entry.get("repo", "")
     reasons = entry.get("reasons", [])
+    kinds = entry.get("kinds", [])
     main = [_anchor(entry.get("url", ""), _display_title(entry), "gr-item-title")]
     main += [
         f'<span class="gr-badge gr-badge--{escape_html(key)}">{escape_html(label)}</span>'
@@ -828,6 +851,7 @@ def _render_item(entry: dict, bucket: str) -> str:
     data_text = " ".join([_display_title(entry), repo, *reasons])
     return (
         f'<div class="gr-item" data-type="{escape_html(" ".join(_badge_keys(entry)))}" '
+        f'data-kinds="{escape_html(" ".join(kinds))}" '
         f'data-age="{escape_html(bucket)}" data-repo="{escape_html(repo)}" '
         f'data-text="{escape_html(data_text)}">'
         f'<div class="gr-item-main">{"".join(main)}</div>{reason_html}</div>'
@@ -931,7 +955,7 @@ def _render_attention(model: dict) -> str:
     new_groups = (att.get("new") or {}).get("groups", [])
     buckets = [b for b in att.get("buckets", []) if b.get("groups")]
     if not new_groups and not buckets:
-        return '<div class="gr-card gr-empty">Nothing to show.</div>'
+        return '<div class="gr-card gr-empty">Nothing needs your attention.</div>'
     parts = [
         _render_toolbar(model),
         _render_chips(model),

@@ -928,6 +928,20 @@ def test_humanize_age_edges():
     assert humanize_age("2025-09-28T06:00:00+00:00", now) == "1 year ago"
 
 
+def test_humanize_age_day_floor_on_calendar_jump(monkeypatch):
+    """BUG-05 (final wave): the day branch floors at 2 — an item updated at
+    23:00 viewed at 00:30 two calendar days later is only 25.5h old, so the
+    elapsed-time floor is 1, but two calendar dates have passed and "1 day
+    ago" would understate the age. Local-calendar checks, so TZ is pinned to
+    UTC (same pattern as the today/yesterday test)."""
+    from gitreport.attention import humanize_age
+
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    now = datetime.fromisoformat("2026-09-30T00:30:00+00:00")
+    assert humanize_age("2026-09-28T23:00:00+00:00", now) == "2 days ago"
+
+
 # --- report model (Task 2: badges, buckets, ages, KPIs) ----------------------
 
 

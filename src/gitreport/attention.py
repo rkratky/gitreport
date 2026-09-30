@@ -113,7 +113,11 @@ def humanize_age(ts: str | None, now: datetime) -> str:
         return "yesterday"
     days = (local_now - local_dt).total_seconds() / 86400
     if days < 7:
-        n = int(days)
+        # Floor at 2: this branch is only reached for a calendar gap of >= 2
+        # days, but the elapsed-time floor can still be 1 (e.g. 23:00 ->
+        # 00:30 two calendar days later = 25.5h). Calendar days have passed,
+        # so "1 day ago" would understate the age.
+        n = max(2, int(days))
         unit = "day"
     elif days < 30.44:
         n = int(days // 7)

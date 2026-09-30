@@ -618,6 +618,84 @@ def test_digest_corrupt_state_does_not_collapse_coverage(mock_load_config, tmp_p
 
 
 @patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_first_run_fresh_state(mock_load_config, tmp_path):
+    """TEST-01a: a fresh state (no state file, no digests) is a first run —
+    the stdout coverage line carries the suffix and the written .json model
+    records coverage.first_run true."""
+    tmp = tmp_path
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert "(first run: last 24 hours)" in result.output
+    model = json.loads((tmp / "digests" / "2026-09-28.json").read_text())
+    assert model["coverage"]["first_run"] is True
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_first_run_false_after_corrupt_state_with_reviewed_digest(
+    mock_load_config, tmp_path
+):
+    """TEST-01b: a corrupt state plus a prior Reviewed digest on disk is NOT
+    a first run — the recovered cursor continues coverage, so the suffix is
+    absent from stdout and the written .json records first_run false."""
+    tmp = tmp_path
+    (tmp / "digests").mkdir()
+    (tmp / "digests" / "2026-09-20.md").write_text(
+        "---\n"
+        "generated_at: 2026-09-20T06:00:00+00:00\n"
+        "coverage_start: 2026-09-13T06:00:00+00:00\n"
+        "---\n\n"
+        "# GitReport digest\n\n"
+        "Status: Reviewed Sun 20 Sep 09:14\n"
+    )
+    (tmp / "state.json").write_text("{corrupt")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "YYYY-MM-DD",
+        latest=tmp / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert "(first run: last 24 hours)" not in result.output
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    model = json.loads((tmp / "digests" / f"{today}.json").read_text())
+    assert model["coverage"]["first_run"] is False
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_first_run_corrupt_state_no_digests(mock_load_config, tmp_path):
+    """TEST-01c: a corrupt state with no digests on disk has no cursor to
+    recover — the 24h first-run fallback applies and the suffix is present."""
+    tmp = tmp_path
+    (tmp / "digests").mkdir()
+    (tmp / "state.json").write_text("{corrupt")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "YYYY-MM-DD",
+        latest=tmp / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert "(first run: last 24 hours)" in result.output
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    model = json.loads((tmp / "digests" / f"{today}.json").read_text())
+    assert model["coverage"]["first_run"] is True
+
+
+@patch("gitreport.main.load_config")
 def test_read_recovers_last_reviewed_from_reviewed_digest(mock_load_config, tmp_path):
     """FINAL-05: after a corrupt-state rebuild, `read` recovers last_reviewed
     from the newest digest's generated_at when its status line says Reviewed.
@@ -1363,6 +1441,45 @@ def test_read_multi_target_updates_every_newer_digest(mock_load_config, tmp_path
         assert model["status"]["reviewed"] is True
         assert model["status"]["reviewed_at"]
         assert "NOT YET REVIEWED" not in (tmp / "digests" / f"{day}.html").read_text()
+
+
+@patch("gitreport.main.load_config")
+def test_read_write_failure_warns_and_continues(mock_load_config, tmp_path):
+    """BUG-03 (final wave): a broken target (its .md replaced by a directory)
+    must not abort `read` — the earlier target is fully updated, the broken
+    one is warned about, and the command still exits 0. The directory is
+    caught by the digest-scan guard before the per-target write guard; both
+    are part of the same never-abort contract."""
+    from gitreport.state import save_state
+
+    tmp = tmp_path
+    (tmp / "digests").mkdir()
+    _write_digest_files(tmp / "digests", "2026-09-26", "2026-09-26T06:00:00+00:00")
+    _write_digest_files(tmp / "digests", "2026-09-28", "2026-09-28T06:00:00+00:00")
+    broken = tmp / "digests" / "2026-09-28.md"
+    broken.unlink()
+    broken.mkdir()
+    save_state(
+        tmp / "state.json",
+        AttentionState(last_reviewed="2026-09-25T06:00:00+00:00"),
+    )
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "YYYY-MM-DD",
+        latest=tmp / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.output
+    assert str(broken) in result.output
+    # The first target (2026-09-26, scanned before the broken one) is fully
+    # updated: restamped .md and reviewed .json.
+    md_text = (tmp / "digests" / "2026-09-26.md").read_text()
+    assert "Status: Reviewed" in md_text
+    model = json.loads((tmp / "digests" / "2026-09-26.json").read_text())
+    assert model["status"]["reviewed"] is True
 
 
 @patch("gitreport.main.load_config")

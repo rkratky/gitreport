@@ -378,14 +378,15 @@ def test_dashboard_activity_skips_empty_providers_and_groups(utc_tz):
 
 def test_dashboard_empty_state_and_stale_warning(utc_tz):
     html = render_dashboard_html(_dash_model({}, stale=("github", "launchpad")))
-    assert "Nothing to show." in html
+    # Same wording as the Markdown empty state (BUG-02, final wave).
+    assert "Nothing needs your attention." in html
     assert "failed to fetch" in html
     assert "github, launchpad" in html
 
 
 def test_dashboard_empty_state_without_stale(utc_tz):
     html = render_dashboard_html(_dash_model({}))
-    assert "Nothing to show." in html
+    assert "Nothing needs your attention." in html
     assert "failed to fetch" not in html
 
 
@@ -446,6 +447,31 @@ def test_dashboard_lp_bug_badge_override(utc_tz):
     html = render_dashboard_html(_dash_model(items))
     assert '<span class="gr-badge gr-badge--bug">bug</span>' in html
     assert 'data-type="bug"' in html
+
+
+def test_dashboard_assigned_kpi_matches_kinds(utc_tz):
+    # BUG-01 (final wave): the Assigned KPI counts kinds ("issue_assigned"),
+    # not type badges — an LP issue_assigned row badges as "bug", so a
+    # badge-based JS count undercounts on load and its click misses LP bugs.
+    # The row carries data-kinds for the JS pseudo-dimension; the script's
+    # assigned filter is kinds-based and its click toggles the issue + bug
+    # type chips together.
+    items = {
+        "lp:1": _dash_rec(
+            provider="launchpad",
+            kinds=["issue_assigned"],
+            repo="lp:ubuntu",
+            title="Fix crash",
+            url="https://bugs.launchpad.net/bugs/1",
+            first_seen=DASH_NOW,
+            last_updated=DASH_NOW,
+        ),
+    }
+    page = render_dashboard_html(_dash_model(items))
+    assert 'data-kinds="issue_assigned"' in page
+    script = _dash_script(page)
+    assert 'assigned: [["kinds", "issue_assigned"]]' in script
+    assert 'assigned: [["type", "issue"], ["type", "bug"]]' in script
 
 
 def test_dashboard_json_round_trip_stable(utc_tz):
@@ -600,6 +626,7 @@ def test_dashboard_inline_script_contract(utc_tz):
     assert "aria-pressed" in script
     assert 'getAttribute("data-text")' in script
     assert 'getAttribute("data-type")' in script
+    assert 'getAttribute("data-kinds")' in script
     assert 'getAttribute("data-age")' in script
     assert 'getAttribute("data-repo")' in script
     # Every sessionStorage access must sit inside a try (in-memory fallback):

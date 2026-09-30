@@ -367,13 +367,18 @@ def digest(config_path_str, open_browser, catch_up):
             )
         )
         stem.parent.mkdir(parents=True, exist_ok=True)
+        # Render-first (BUG-04): every artifact body — and the HTML render —
+        # is built BEFORE any write, so a render failure leaves the previous
+        # artifacts and symlinks untouched instead of a half-updated set.
         # All three artifacts are written atomically (tmp + os.replace); the
         # .json model snapshot is renderer infrastructure: always written,
         # never symlinked (config validation forbids "json" in digest_formats).
+        json_text = json.dumps(model, indent=2)
+        html_text = render_dashboard_html(model) if "html" in att.digest_formats else None
         atomic_write_text(_stem_file(stem, "md"), md_text)
-        atomic_write_text(_stem_file(stem, "json"), json.dumps(model, indent=2))
-        if "html" in att.digest_formats:
-            atomic_write_text(_stem_file(stem, "html"), render_dashboard_html(model))
+        atomic_write_text(_stem_file(stem, "json"), json_text)
+        if html_text is not None:
+            atomic_write_text(_stem_file(stem, "html"), html_text)
         _refresh_symlinks(stem, att.digest_latest, att.digest_formats)
 
     click.echo(strip_front_matter(md_text)[1])
@@ -431,12 +436,19 @@ def read(config_path_str, open_browser):
         reviewed_local = datetime.fromisoformat(now).astimezone()
         stamp = f"Status: Reviewed {reviewed_local:%a %-d %b %H:%M}"
         for path in targets:
-            text = path.read_text()
-            stamped = replace_status_line(text, stamp)
-            # The restamp always happens first and is never gated on the
-            # sibling .json's usability (spec: never fail the command).
-            path.write_text(stamped)
-            _advance_digest_artifacts(path, stamped, now, "html" in att.digest_formats)
+            # A write failure on one target (disk full, EACCES) must not
+            # abort the remaining targets — the cursor has already advanced,
+            # so a crash here would strand every later digest unstamped.
+            try:
+                text = path.read_text()
+                stamped = replace_status_line(text, stamp)
+                # The restamp always happens first and is never gated on the
+                # sibling .json's usability (spec: never fail the command).
+                path.write_text(stamped)
+                _advance_digest_artifacts(path, stamped, now, "html" in att.digest_formats)
+            except OSError as e:
+                click.echo(f"Warning: could not update {path} ({e})", err=True)
+                continue
     if open_browser:
         ext = "html" if "html" in att.digest_formats else "md"
         _open_in_browser(_stem_file(att.digest_latest, ext))
@@ -809,7 +821,15 @@ def _digests_generated_after(pattern: Path, previous: str | None) -> tuple[str |
     for path in parent.glob("*.md"):
         if not stem_re.match(path.name):
             continue
-        meta, _body = strip_front_matter(path.read_text())
+        # A candidate that cannot be read (its .md replaced by a directory,
+        # EACCES, invalid UTF-8) must not abort the scan — `read` would crash
+        # before the per-target write guard can run. Warn and skip: the entry
+        # carries no front matter, so it can never be a target.
+        try:
+            meta, _body = strip_front_matter(path.read_text())
+        except (OSError, UnicodeDecodeError) as e:
+            click.echo(f"Warning: could not read {path} ({e}); skipping it.", err=True)
+            continue
         ts = meta.get("generated_at")
         if ts:
             digests.append((ts, path))
