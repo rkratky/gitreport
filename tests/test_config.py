@@ -229,3 +229,88 @@ def test_digest_latest_stem_state_collision_rejected(tmp_path: Path):
 
     with pytest.raises(ValueError, match="collision"):
         load_config(config_file)
+
+
+def test_digest_output_dated_state_path_collision_rejected(tmp_path: Path):
+    """CFG-01-R1: a literal dated state file name (e.g. 2026-09-28.json)
+    collides with the YYYY-MM-DD digest stem by pattern — not only via a
+    fixed substitute date."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": str(tmp_path / "digests" / "2026-09-28.json"),
+            "digest_output": str(tmp_path / "digests" / "YYYY-MM-DD"),
+            "digest_latest": str(tmp_path / "digests" / "latest"),
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    with pytest.raises(ValueError, match="collision"):
+        load_config(config_file)
+
+
+def test_digest_output_token_stem_plain_state_path_accepted(tmp_path: Path):
+    r"""CFG-01-R1: the dated pattern only matches \d{4}-\d{2}-\d{2} file
+    names — `state.json` next to the YYYY-MM-DD stem does not collide."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": str(tmp_path / "digests" / "state.json"),
+            "digest_output": str(tmp_path / "digests" / "YYYY-MM-DD"),
+            "digest_latest": str(tmp_path / "digests" / "latest"),
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+
+    assert config.attention.state_path == tmp_path / "digests" / "state.json"
+
+
+def test_collision_check_runs_after_anchoring(tmp_path: Path, monkeypatch):
+    """CFG-01-R2: the collision check must see post-anchoring paths. A
+    relative `digest_output` anchored to the config file's parent colliding
+    with a ~-absolute `state_path` is rejected (a pre-anchoring check would
+    compare against the CWD and miss it)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_dir = tmp_path / ".config" / "gitreport"
+    config_dir.mkdir(parents=True)
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": "~/.config/gitreport/state.json",
+            "digest_output": "state",  # relative → anchored next to the config
+            "digest_latest": "digests/latest",
+        },
+    }
+    config_file = config_dir / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    with pytest.raises(ValueError, match="collision"):
+        load_config(config_file)
+
+
+def test_no_collision_after_anchoring_accepted(tmp_path: Path, monkeypatch):
+    """CFG-01-R2: non-colliding relative paths still load after anchoring."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_dir = tmp_path / ".config" / "gitreport"
+    config_dir.mkdir(parents=True)
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": "~/.config/gitreport/state.json",
+            "digest_output": "digests/YYYY-MM-DD",
+            "digest_latest": "digests/latest",
+        },
+    }
+    config_file = config_dir / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+
+    assert config.attention.state_path == (tmp_path / ".config" / "gitreport" / "state.json")
+    assert config.attention.digest_output == (
+        tmp_path / ".config" / "gitreport" / "digests" / "YYYY-MM-DD"
+    )
