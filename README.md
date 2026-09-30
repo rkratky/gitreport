@@ -29,7 +29,34 @@ Launchpad API limitation, not a bug in this tool.
 
 ## Installation
 
-This project uses [Poetry](https://python-poetry.org/) for dependency management.
+Two ways to install, depending on what you want:
+
+### As a CLI tool (recommended for daily use)
+
+[pipx](https://pipx.pypa.io/) installs the tool into its own persistent virtual
+environment and exposes a stable `gitreport` entrypoint on your PATH — nothing
+depends on a project-local or hash-named venv that can break or move:
+
+```bash
+git clone <repository-url>
+cd gitreport
+pipx install .
+```
+
+The tool is now available everywhere as `gitreport` (`~/.local/bin/gitreport`).
+
+**Upgrading:** after pulling new code, reinstall in one step — run this from
+anywhere:
+
+```bash
+pipx install --force /path/to/your/gitreport-clone
+```
+
+### For development
+
+This project uses [Poetry](https://python-poetry.org/) for dependency
+management. The Poetry environment is only for running tests and linters;
+the pipx-installed CLI above does not depend on it.
 
 1.  **Clone the repository:**
     ```bash
@@ -235,7 +262,7 @@ Description=GitReport daily digest
 
 [Service]
 Type=oneshot
-ExecStart=%h/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest
+ExecStart=%h/.local/bin/gitreport digest
 ```
 
 ```ini
@@ -257,10 +284,9 @@ Then enable the timer:
 systemctl --user enable --now gitreport-digest.timer
 ```
 
-`%h` expands to your home directory. Substitute your actual Poetry virtualenv
-path in `ExecStart` — `poetry env info --path` prints it (with in-project
-virtualenvs it is `<repo>/.venv`). The entrypoint is called directly from the
-venv's `bin/`; no `poetry run` wrapper is needed.
+`%h` expands to your home directory. The `ExecStart` paths assume the pipx
+install from [Installation](#installation) (`~/.local/bin/gitreport`), which is
+stable across upgrades — systemd units never need repointing.
 
 `Persistent=true` makes the timer fire shortly after boot if the schedule
 elapsed while the machine was off, so the catch-up digest is typically ready
@@ -290,7 +316,7 @@ After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate
 Type=oneshot
 User=yourusername
 Environment=HOME=/home/yourusername
-ExecStart=/home/yourusername/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest --catch-up
+ExecStart=/home/yourusername/.local/bin/gitreport digest --catch-up
 
 [Install]
 WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
@@ -309,8 +335,8 @@ per day; the scheduled timer keeps using plain `digest` and always runs.
 ### cron equivalent
 
 ```cron
-30 7 * * * $HOME/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest
-@reboot        $HOME/.cache/pypoetry/virtualenvs/gitreport-<hash>/bin/gitreport digest --catch-up
+30 7 * * * $HOME/.local/bin/gitreport digest
+@reboot        $HOME/.local/bin/gitreport digest --catch-up
 ```
 
 Plain cron simply runs at the next scheduled time; coverage is identical
