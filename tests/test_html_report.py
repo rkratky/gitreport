@@ -1,8 +1,19 @@
+import json
+import re
+import time
+
+import pytest
+
+from gitreport.attention import report_model
 from gitreport.html_report import (
+    atomic_write_text,
+    render_dashboard_html,
     render_html,
     replace_status_line,
     strip_front_matter,
 )
+from gitreport.providers.base import empty_repo_activity
+from gitreport.state import AttentionState
 
 MD = """---
 generated_at: 2026-09-28T06:00:00+00:00
@@ -140,3 +151,331 @@ def test_render_html_preserves_literal_title_in_prose():
     md = MD.replace("[T](https://github.com/o/r/pull/1)", 'see the title="hi" note')
     html = render_html(md)
     assert 'title="hi"' in html
+
+
+# --- dashboard renderer (Task 5: dark theme, static, model-based) ------------
+
+DASH_NOW = "2026-09-28T06:00:00+00:00"
+
+
+@pytest.fixture
+def utc_tz(monkeypatch):
+    """Pin the local timezone to UTC so local-time strings are deterministic
+    (POSIX-only, like the rest of the suite; conftest restores after each test)."""
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+
+
+def _dash_rec(**overrides):
+    base = {
+        "status": "open",
+        "origins": ["notification"],
+        "kinds": ["mention"],
+        "reasons": [],
+        "repo": "o/r",
+        "title": "T",
+        "url": "https://x/1",
+        "first_seen": DASH_NOW,
+        "last_updated": DASH_NOW,
+        "acked": False,
+        "acked_at": None,
+        "resolved_at": None,
+        "pinned": False,
+        "reopen_count": 0,
+        "thread_url": None,
+        "provider": "github",
+    }
+    base.update(overrides)
+    return base
+
+
+def _dash_model(items=None, *, first_run=False, stale=(), activity=None):
+    extra = {} if first_run else {"last_reviewed": "2026-09-27T06:00:00+00:00"}
+    return report_model(
+        AttentionState.model_validate({"version": 1, "items": items or {}, **extra}),
+        generated_at=DASH_NOW,
+        coverage_start="2026-09-27T06:00:00+00:00",
+        first_run=first_run,
+        stale_providers=list(stale),
+        activity_data=activity,
+    )
+
+
+def _dash_items():
+    return {
+        "gh:1": _dash_rec(
+            title="New one",
+            kinds=["ci_failure", "stale_pr"],
+            reasons=["3 unresolved comments"],
+            url="https://github.com/o/r/pull/1",
+            first_seen=DASH_NOW,
+            last_updated=DASH_NOW,
+        ),
+        "gh:2": _dash_rec(
+            repo="o/r2",
+            url="https://github.com/o/r2/pull/2",
+            first_seen="2026-09-01T06:00:00+00:00",
+            last_updated="2026-09-01T06:00:00+00:00",
+            reopen_count=1,
+        ),
+    }
+
+
+def test_dashboard_dark_theme_static(utc_tz):
+    html = render_dashboard_html(_dash_model(_dash_items()))
+    assert '<html lang="en">' in html
+    assert "--gr-bg" in html
+    assert "#111318" in html
+    assert "--gr-brand:#e95420" in html
+    assert "<script" not in html  # static until Task 6
+    assert "<img" not in html
+    assert "src=" not in html
+    # Every href is a model item link (rows + right-column summaries), nothing else.
+    assert re.findall(r'href="([^"]*)"', html) == [
+        "https://github.com/o/r/pull/1",  # gh:1 row
+        "https://github.com/o/r2/pull/2",  # gh:2 row
+        "https://github.com/o/r/pull/1",  # CI failures summary
+        "https://github.com/o/r/pull/1",  # stale PRs summary
+    ]
+
+
+def test_dashboard_header_coverage_status_ages(utc_tz):
+    html = render_dashboard_html(_dash_model(_dash_items()))
+    assert "GitReport digest" in html
+    assert "Coverage: Sun 27 Sep – Mon 28 Sep (1 day since last review)" in html
+    assert "ages as of Mon 28 Sep, 06:00" in html
+    assert "gr-status--amber" in html
+    assert "NOT YET REVIEWED — run gitreport read" in html
+    # The stylesheet always defines both pill classes; assert on the element.
+    assert "gr-status gr-status--green" not in html
+
+
+def test_dashboard_first_run_suffix(utc_tz):
+    html = render_dashboard_html(_dash_model({}, first_run=True))
+    assert "(first run: last 24 hours)" in html
+
+
+def test_dashboard_reviewed_status_pill(utc_tz):
+    model = _dash_model(_dash_items())
+    model["status"] = {"reviewed": True, "reviewed_at": "2026-09-28T09:14:00+00:00"}
+    html = render_dashboard_html(model)
+    assert "gr-status--green" in html
+    assert "Reviewed Mon 28 Sep 09:14" in html
+    assert "NOT YET REVIEWED" not in html
+
+
+def test_dashboard_kpi_cards(utc_tz):
+    html = render_dashboard_html(_dash_model(_dash_items()))
+    assert re.findall(r'data-kpi="([a-z_]+)"', html) == [
+        "new",
+        "still_open",
+        "assigned",
+        "ci_failing",
+        "stale_prs",
+    ]
+
+
+def test_dashboard_kpi_cards_zero(utc_tz):
+    html = render_dashboard_html(_dash_model({}))
+    assert re.findall(r'data-kpi="([a-z_]+)"', html) == [
+        "new",
+        "still_open",
+        "assigned",
+        "ci_failing",
+        "stale_prs",
+    ]
+    assert html.count('class="gr-kpi-value">0<') == 5
+
+
+def test_dashboard_sections_details_and_item_attrs(utc_tz):
+    html = render_dashboard_html(_dash_model(_dash_items()))
+    # New section first, then populated buckets only.
+    assert "<h2>New since last review</h2>" in html
+    assert "<h2>Last 30 days</h2>" in html
+    assert "<h2>Today</h2>" not in html
+    assert "<h2>Last 7 days</h2>" not in html
+    assert "<h2>Older</h2>" not in html
+    # Repo groups: collapsible, carry repo + bucket key for the JS contract.
+    assert '<details class="gr-repo" open data-repo="o/r" data-age="new">' in html
+    assert '<details class="gr-repo" open data-repo="o/r2" data-age="month">' in html
+    assert "<summary>o/r (1)</summary>" in html
+    assert "<summary>o/r2 (1)</summary>" in html
+    # Item rows: filterable attributes, badges, age, re-opened marker, reasons.
+    assert 'data-type="ci stale"' in html
+    assert 'data-type="mention"' in html
+    assert 'data-age="new"' in html
+    assert 'data-age="month"' in html
+    assert 'data-repo="o/r"' in html
+    assert 'data-text="New one o/r 3 unresolved comments"' in html
+    assert '<span class="gr-badge gr-badge--ci">CI</span>' in html
+    assert '<span class="gr-badge gr-badge--stale">stale</span>' in html
+    assert '<span class="gr-badge gr-badge--mention">mention</span>' in html
+    assert '<span class="gr-age">today</span>' in html
+    assert '<span class="gr-age">3 weeks ago</span>' in html
+    assert '<span class="gr-reopened">re-opened</span>' in html
+    assert '<div class="gr-reason">3 unresolved comments</div>' in html
+    assert 'href="https://github.com/o/r/pull/1">New one</a>' in html
+
+
+def test_dashboard_filter_chips(utc_tz):
+    html = render_dashboard_html(_dash_model(_dash_items()))
+    assert 'placeholder="Filter\u2026"' in html
+    # One chip per type key present, in model (precedence) order.
+    assert re.findall(r'data-dim="type" data-val="([a-z]+)"', html) == [
+        "ci",
+        "stale",
+        "mention",
+    ]
+    # Age chips are the fixed five-dimension set.
+    assert re.findall(r'data-dim="age" data-val="([a-z]+)"', html) == [
+        "new",
+        "today",
+        "week",
+        "month",
+        "older",
+    ]
+    assert re.findall(r'data-dim="repo" data-val="([^"]+)"', html) == ["o/r", "o/r2"]
+
+
+def test_dashboard_summary_lists(utc_tz):
+    html = render_dashboard_html(_dash_model(_dash_items()))
+    assert "Needs summary" in html
+    assert "CI failures" in html
+    assert "Stale PRs" in html
+    # gh:1 (CI + stale) appears in both summaries with link and age.
+    assert html.count('href="https://github.com/o/r/pull/1"') == 3
+
+
+def test_dashboard_activity_card(utc_tz):
+    repo = empty_repo_activity("public")
+    repo["prs_merged"].append(
+        {"title": "Land docs", "url": "https://github.com/o/r/pr/9", "also_merged": True}
+    )
+    html = render_dashboard_html(_dash_model({}, activity={"github": {"o/r": repo}}))
+    assert "GitHub" in html
+    assert "PRs merged" in html
+    assert 'href="https://github.com/o/r/pr/9">Land docs</a>' in html
+    assert "→ merged, too" in html
+    assert "public" in html
+
+
+def test_dashboard_activity_skips_empty_providers_and_groups(utc_tz):
+    # The a/b empty case from Task 3: an all-empty repo group renders nothing,
+    # and a provider with only such groups is dropped entirely.
+    merged = empty_repo_activity("public")
+    merged["prs_merged"].append({"title": "M", "url": "https://x/2"})
+    data = {
+        "ghostprov": {"ghost/repo": empty_repo_activity("private")},
+        "github": {"o/r": merged, "a/b": empty_repo_activity("public")},
+    }
+    html = render_dashboard_html(_dash_model({}, activity=data))
+    assert "Ghostprov" not in html
+    assert "ghost/repo" not in html
+    assert "a/b" not in html
+    assert 'href="https://x/2">M</a>' in html
+
+
+def test_dashboard_empty_state_and_stale_warning(utc_tz):
+    html = render_dashboard_html(_dash_model({}, stale=("github", "launchpad")))
+    assert "Nothing to show." in html
+    assert "failed to fetch" in html
+    assert "github, launchpad" in html
+
+
+def test_dashboard_empty_state_without_stale(utc_tz):
+    html = render_dashboard_html(_dash_model({}))
+    assert "Nothing to show." in html
+    assert "failed to fetch" not in html
+
+
+def test_dashboard_hostile_title_inert(utc_tz):
+    items = {
+        "gh:h": _dash_rec(
+            title="<script>alert(1)</script>",
+            url="javascript:alert(1)",
+            reasons=['say "hi" & <b>'],
+            first_seen=DASH_NOW,
+            last_updated=DASH_NOW,
+        ),
+    }
+    html = render_dashboard_html(_dash_model(items))
+    assert "<script>alert" not in html
+    assert "javascript:" not in html  # scheme guard: no link, URL never rendered
+    assert "<img" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html  # title shown, escaped
+    assert "say &quot;hi&quot; &amp; &lt;b&gt;" in html  # reasons escaped too
+
+
+def test_dashboard_renderer_url_guard(utc_tz):
+    # The model's URL is guarded upstream, but the renderer re-checks so a
+    # hand-built model cannot inject a link either.
+    model = _dash_model(_dash_items())
+    model["attention"]["new"]["groups"][0]["items"][0]["url"] = "javascript:alert(1)"
+    html = render_dashboard_html(model)
+    assert "javascript:" not in html
+    assert "New one" in html  # title still shown as plain text
+
+    model = _dash_model(_dash_items())
+    model["attention"]["new"]["groups"][0]["items"][0][
+        "url"
+    ] = 'https://ok.example/1"onmouseover="x'
+    html = render_dashboard_html(model)
+    assert "onmouseover" not in html
+
+
+def test_dashboard_item_without_url(utc_tz):
+    model = _dash_model(_dash_items())
+    model["attention"]["new"]["groups"][0]["items"][0]["url"] = ""
+    html = render_dashboard_html(model)
+    assert '<span class="gr-item-title">New one</span>' in html
+
+
+def test_dashboard_lp_bug_badge_override(utc_tz):
+    items = {
+        "lp:1": _dash_rec(
+            provider="launchpad",
+            kinds=["issue_assigned"],
+            repo="lp:ubuntu",
+            title="Fix crash",
+            url="https://bugs.launchpad.net/bugs/1",
+            first_seen=DASH_NOW,
+            last_updated=DASH_NOW,
+        ),
+    }
+    html = render_dashboard_html(_dash_model(items))
+    assert '<span class="gr-badge gr-badge--bug">bug</span>' in html
+    assert 'data-type="bug"' in html
+
+
+def test_dashboard_json_round_trip_stable(utc_tz):
+    repo = empty_repo_activity("public")
+    repo["prs_merged"].append({"title": "M", "url": "https://x/2", "also_merged": True})
+    model = _dash_model(
+        _dash_items(),
+        activity={"github": {"o/r": repo}, "gitlab": {"g/r": empty_repo_activity("public")}},
+    )
+    model["status"] = {"reviewed": True, "reviewed_at": DASH_NOW}
+    assert render_dashboard_html(json.loads(json.dumps(model))) == render_dashboard_html(model)
+
+
+def test_dashboard_schema_version_tolerated(utc_tz):
+    model = _dash_model(_dash_items())
+    model["schema_version"] = 99
+    html = render_dashboard_html(model)
+    assert "GitReport digest" in html
+
+
+def test_atomic_write_text_creates_parent_and_writes(tmp_path):
+    target = tmp_path / "sub" / "dir" / "out.html"
+    result = atomic_write_text(target, "<p>hi</p>")
+    assert result == target
+    assert target.read_text(encoding="utf-8") == "<p>hi</p>"
+    assert [p.name for p in target.parent.iterdir()] == ["out.html"]  # tmp cleaned up
+
+
+def test_atomic_write_text_replaces_existing(tmp_path):
+    target = tmp_path / "out.html"
+    atomic_write_text(target, "old")
+    atomic_write_text(target, "new")
+    assert target.read_text(encoding="utf-8") == "new"
+    assert [p.name for p in tmp_path.iterdir()] == ["out.html"]

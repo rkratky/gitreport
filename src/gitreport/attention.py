@@ -630,10 +630,14 @@ def _render_item_line(entry: dict) -> str:
 
 
 def _render_groups(groups: list[dict]) -> list[str]:
-    """`#### <repo>` blocks for one tier/bucket, in model order."""
+    """`#### <repo>` blocks for one tier/bucket, in model order. Repo names
+    are plain model text and pass through escape_user here (render-time
+    escaping, same contract as titles/reasons); an empty repo renders the
+    fixed `(unknown repo)` literal instead of a bare heading."""
     lines: list[str] = []
     for group in groups:
-        lines += [f"#### {group['repo']}", ""]
+        repo = escape_user(group["repo"]) if group.get("repo") else "(unknown repo)"
+        lines += [f"#### {repo}", ""]
         lines += [_render_item_line(entry) for entry in group.get("items", [])]
         lines.append("")
     return lines

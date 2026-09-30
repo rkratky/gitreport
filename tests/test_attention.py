@@ -1382,3 +1382,19 @@ def test_report_model_activity_wiring():
     md = model["activity"]["markdown"]
     assert "# Git activity report" in md
     assert "- [T](https://x/1)" in md
+
+
+def test_render_digest_markdown_unknown_repo_group():
+    """A model item with an empty repo renders the `(unknown repo)` heading
+    instead of a bare `####` (Task 5 controller note)."""
+    model = _model({"gh:e": rec(repo="", first_seen=NOW, last_updated=NOW)})
+    md = render_digest_markdown(model)
+    assert "#### (unknown repo)" in md
+
+
+def test_render_digest_markdown_repo_escaped():
+    """Repo headings pass through escape_user — a repo name carrying HTML
+    specials cannot inject markup into the digest."""
+    model = _model({"gh:x": rec(repo="a<b & c", first_seen=NOW, last_updated=NOW)})
+    md = render_digest_markdown(model)
+    assert "#### a&lt;b &amp; c" in md

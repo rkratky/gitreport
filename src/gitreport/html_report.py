@@ -6,10 +6,17 @@ code spans containing ``<`` or ``&`` — those render literally. Accepted: the
 digest format never emits those constructs.
 """
 
+import contextlib
 import html
+import os
 import re
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
 
 import markdown
+
+from .attention import _safe_url
 
 _TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -110,3 +117,644 @@ def render_html(md_text: str, title: str = "GitReport digest") -> str:
     rendered = _UNSAFE_HREF_RE.sub('href="#"', rendered)
     rendered = _LINK_TITLE_ATTR_RE.sub(r"\1", rendered)
     return _TEMPLATE.format(title=html.escape(title), body=rendered)
+
+
+# --- dashboard (Task 5: dark theme, static, from the report model) -----------
+#
+# The renderer consumes the report model only. The model carries PLAIN text
+# (state-stored titles/reasons are unescaped upstream, activity titles arrive
+# raw): every dynamic string goes through escape_html here, attribute values
+# included. URLs are guarded again by attention._safe_url (the single guard
+# both renderers share) — html.escape alone cannot neutralise a javascript:
+# href, so an unsafe URL degrades to plain text. The page is fully static:
+# no <script> yet (Task 6 adds inline JS that reads the DOM only), no <img>,
+# no external references.
+
+_DARK_CSS = """
+:root {
+  --gr-bg:#111318;
+  --gr-card:#1c1f26;
+  --gr-border:#2e3340;
+  --gr-text:#e8eaf0;
+  --gr-muted:#8a93a6;
+  --gr-brand:#e95420;
+  --gr-accent:#0f95a1;
+  --gr-pos:#3fb54a;
+  --gr-caution:#f99b11;
+  --gr-neg:#e9545b;
+  --gr-info:#4c8dff;
+  --gr-purple:#a871ff;
+  --gr-grey:#8a93a6;
+  --gr-radius: 12px;
+  --gr-radius-sm: 8px;
+  --gr-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 1.5rem 1rem 3rem;
+  background: var(--gr-bg);
+  color: var(--gr-text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+a { color: var(--gr-info); }
+.gr-header { max-width: 1280px; margin: 0 auto 1rem; }
+.gr-header h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
+.gr-coverage { margin: 0; color: var(--gr-muted); }
+.gr-asof {
+  margin: 0.15rem 0 0.6rem;
+  font-size: 0.8rem;
+  font-style: italic;
+  color: var(--gr-muted);
+}
+.gr-status {
+  display: inline-block;
+  padding: 0.2rem 0.7rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.gr-status--amber {
+  color: var(--gr-caution);
+  border-color: var(--gr-caution);
+  background: rgba(249, 155, 17, 0.12);
+}
+.gr-status--green {
+  color: var(--gr-pos);
+  border-color: var(--gr-pos);
+  background: rgba(63, 181, 74, 0.12);
+}
+.gr-banner {
+  max-width: 1280px;
+  margin: 0 auto 1rem;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--gr-radius-sm);
+  font-size: 0.85rem;
+}
+.gr-banner--warn {
+  border: 1px solid var(--gr-caution);
+  background: rgba(249, 155, 17, 0.1);
+  color: var(--gr-caution);
+}
+.gr-kpis {
+  max-width: 1280px;
+  margin: 0 auto 1rem;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+@media (max-width: 720px) { .gr-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.gr-kpi {
+  background: var(--gr-card);
+  border: 1px solid var(--gr-border);
+  border-top: 3px solid var(--gr-grey);
+  border-radius: var(--gr-radius-sm);
+  padding: 0.6rem 0.8rem;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--gr-shadow);
+}
+.gr-kpi-value { font-size: 1.35rem; font-weight: 650; }
+.gr-kpi-label {
+  font-size: 0.72rem;
+  color: var(--gr-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.gr-cols {
+  max-width: 1280px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+@media (min-width: 900px) { .gr-cols { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); } }
+.gr-card {
+  background: var(--gr-card);
+  border: 1px solid var(--gr-border);
+  border-radius: var(--gr-radius);
+  padding: 1rem;
+  box-shadow: var(--gr-shadow);
+}
+.gr-col-right .gr-card { margin-bottom: 1rem; }
+.gr-card h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+.gr-card h3 { font-size: 0.85rem; margin: 0.8rem 0 0.25rem; color: var(--gr-muted); }
+.gr-section { margin-bottom: 1.25rem; }
+.gr-section > h2 { font-size: 1.05rem; margin: 0 0 0.5rem; }
+.gr-search {
+  width: 100%;
+  margin-bottom: 0.5rem;
+  padding: 0.45rem 0.7rem;
+  background: var(--gr-card);
+  color: var(--gr-text);
+  border: 1px solid var(--gr-border);
+  border-radius: var(--gr-radius-sm);
+  font: inherit;
+}
+.gr-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.75rem; }
+.gr-chip {
+  border: 1px solid var(--gr-border);
+  background: transparent;
+  color: var(--gr-muted);
+  border-radius: 999px;
+  padding: 0.1rem 0.6rem;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.gr-repo {
+  background: var(--gr-card);
+  border: 1px solid var(--gr-border);
+  border-radius: var(--gr-radius-sm);
+  margin-bottom: 0.6rem;
+  box-shadow: var(--gr-shadow);
+}
+.gr-repo > summary { cursor: pointer; padding: 0.5rem 0.8rem; font-size: 0.9rem; font-weight: 600; }
+.gr-items { padding: 0 0.8rem 0.6rem; }
+.gr-item { padding: 0.45rem 0; border-top: 1px solid var(--gr-border); }
+.gr-item-main { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem; }
+.gr-item-title, .gr-sum-title, .gr-act-title {
+  color: var(--gr-text);
+  text-decoration: none;
+  font-weight: 550;
+}
+a.gr-item-title:hover, a.gr-sum-title:hover, a.gr-act-title:hover {
+  color: var(--gr-brand);
+  text-decoration: underline;
+}
+.gr-badge {
+  display: inline-block;
+  padding: 0 0.45rem;
+  border: 1px solid var(--gr-grey);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--gr-grey);
+  background: rgba(138, 147, 166, 0.12);
+}
+.gr-badge--ci {
+  color: var(--gr-neg);
+  border-color: var(--gr-neg);
+  background: rgba(233, 84, 91, 0.13);
+}
+.gr-badge--pr {
+  color: var(--gr-brand);
+  border-color: var(--gr-brand);
+  background: rgba(233, 84, 32, 0.13);
+}
+.gr-badge--thread {
+  color: var(--gr-purple);
+  border-color: var(--gr-purple);
+  background: rgba(168, 113, 255, 0.13);
+}
+.gr-badge--issue {
+  color: var(--gr-caution);
+  border-color: var(--gr-caution);
+  background: rgba(249, 155, 17, 0.13);
+}
+.gr-badge--bug {
+  color: var(--gr-caution);
+  border-color: var(--gr-caution);
+  background: rgba(249, 155, 17, 0.13);
+}
+.gr-badge--mp { color: var(--gr-brand); border-color: var(--gr-brand); background: transparent; }
+.gr-badge--mention {
+  color: var(--gr-accent);
+  border-color: var(--gr-accent);
+  background: rgba(15, 149, 161, 0.13);
+}
+.gr-badge--comment {
+  color: var(--gr-info);
+  border-color: var(--gr-info);
+  background: rgba(76, 141, 255, 0.13);
+}
+.gr-badge--stale {
+  color: var(--gr-grey);
+  border-color: var(--gr-grey);
+  background: rgba(138, 147, 166, 0.12);
+}
+.gr-badge--item {
+  color: var(--gr-muted);
+  border-color: var(--gr-muted);
+  background: rgba(138, 147, 166, 0.1);
+}
+.gr-age { color: var(--gr-muted); font-size: 0.75rem; }
+.gr-reopened { color: var(--gr-caution); font-size: 0.75rem; font-weight: 600; }
+.gr-reason { color: var(--gr-muted); font-size: 0.8rem; margin-top: 0.1rem; }
+.gr-muted { color: var(--gr-muted); }
+.gr-empty { color: var(--gr-muted); }
+.gr-sum-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border-top: 1px solid var(--gr-border);
+}
+.gr-act-provider { margin-bottom: 0.75rem; }
+.gr-act-provider > h3 { margin-top: 0.25rem; }
+.gr-act-repo { margin-top: 0.5rem; }
+.gr-act-repo-head { font-weight: 600; font-size: 0.9rem; }
+.gr-vis {
+  margin-left: 0.35rem;
+  padding: 0 0.4rem;
+  border: 1px solid var(--gr-border);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--gr-muted);
+}
+.gr-act-cat {
+  margin-top: 0.35rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--gr-accent);
+}
+.gr-act-item { padding: 0.1rem 0; font-size: 0.85rem; }
+.gr-merged { margin-left: 0.35rem; font-size: 0.75rem; color: var(--gr-pos); }
+"""
+
+# KPI strip: key order and labels are the Task 6 JS contract (data-kpi); the
+# accent colours give each card its top border.
+_KPI_DEFS = [
+    ("new", "New", "var(--gr-accent)"),
+    ("still_open", "Still open", "var(--gr-info)"),
+    ("assigned", "Assigned", "var(--gr-caution)"),
+    ("ci_failing", "CI failing", "var(--gr-neg)"),
+    ("stale_prs", "Stale PRs", "var(--gr-grey)"),
+]
+
+# Fixed five-chip age dimension; data-val matches item data-age / group
+# data-age ("new" included even though it is a tier, not an age bucket).
+_AGE_CHIPS = [
+    ("new", "New"),
+    ("today", "Today"),
+    ("week", "Last 7 days"),
+    ("month", "Last 30 days"),
+    ("older", "Older"),
+]
+
+
+def escape_html(s) -> str:
+    """Escape plain model text for text nodes AND attribute values."""
+    return html.escape(str(s), quote=True)
+
+
+def atomic_write_text(path: Path, text: str) -> Path:
+    """Write `text` to `path` atomically: parent dirs are created, the text
+    lands in a sibling temp file that then os.replace()s the target, so a
+    reader never observes a half-written artifact."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+    return path
+
+
+def _parse_ts(ts) -> datetime | None:
+    """Parse an ISO timestamp; naive values are treated as UTC (same
+    convention as attention). Unparseable/absent input returns None."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+
+
+def _fmt_local(ts, with_time: bool = False) -> str:
+    """Local-calendar display of a stored UTC ISO string ("Mon 27 Sep",
+    with a "HH:MM" suffix when with_time); "?" for unparseable input."""
+    dt = _parse_ts(ts)
+    if dt is None:
+        return "?"
+    local = dt.astimezone()
+    if with_time:
+        return f"{local:%a} {local.day} {local:%b}, {local:%H:%M}"
+    return f"{local:%a} {local.day} {local:%b}"
+
+
+def _coverage_days(coverage: dict) -> int:
+    """Coverage days with the same defensive degrade as the Markdown
+    renderer: stored value when sane, else derived from the bounds, else 1."""
+    days = coverage.get("days")
+    if isinstance(days, int) and not isinstance(days, bool) and days >= 1:
+        return days
+    start_dt, end_dt = _parse_ts(coverage.get("start")), _parse_ts(coverage.get("end"))
+    if start_dt is None or end_dt is None:
+        return 1
+    return max(1, (end_dt - start_dt).days)
+
+
+def _status_pill(model: dict) -> str:
+    """The banner state: amber until reviewed, green with the local review
+    time once model.status says so."""
+    status = model.get("status") or {}
+    if status.get("reviewed"):
+        at = _parse_ts(status.get("reviewed_at") or "")
+        label = "Reviewed"
+        if at is not None:
+            local = at.astimezone()
+            label = f"Reviewed {local:%a} {local.day} {local:%b} {local:%H:%M}"
+        return f'<span class="gr-status gr-status--green">{escape_html(label)}</span>'
+    return '<span class="gr-status gr-status--amber">NOT YET REVIEWED — run gitreport read</span>'
+
+
+def _anchor(url, text, cls: str) -> str:
+    """Attribute-escaped link for a model URL; plain escaped text when the
+    URL is falsy or fails the re-checked scheme/unsafe-char guard."""
+    safe = _safe_url(url or "")
+    if safe:
+        return f'<a class="{cls}" href="{escape_html(safe)}">{escape_html(text)}</a>'
+    return f'<span class="{cls}">{escape_html(text)}</span>'
+
+
+def _display_title(entry: dict) -> str:
+    return entry.get("title") or entry.get("id") or "(untitled)"
+
+
+def _badge_keys(entry: dict) -> list[str]:
+    return [badge[1] for badge in entry.get("type_badges", [])]
+
+
+def _attention_items(model: dict) -> list[dict]:
+    """Every attention item in model order (new tier, then the buckets)."""
+    att = model.get("attention") or {}
+    items: list[dict] = []
+    for group in (att.get("new") or {}).get("groups", []):
+        items += group.get("items", [])
+    for bucket in att.get("buckets", []):
+        for group in bucket.get("groups", []):
+            items += group.get("items", [])
+    return items
+
+
+def _render_item(entry: dict, bucket: str) -> str:
+    """One .gr-item row: title link, badge pills, age, re-opened marker and
+    muted reasons. The data-* attributes are the Task 6 filter/search
+    contract: data-type (space-joined badge keys), data-age, data-repo and
+    data-text (title + repo + reasons, all escaped)."""
+    repo = entry.get("repo", "")
+    reasons = entry.get("reasons", [])
+    main = [_anchor(entry.get("url", ""), _display_title(entry), "gr-item-title")]
+    main += [
+        f'<span class="gr-badge gr-badge--{escape_html(key)}">{escape_html(label)}</span>'
+        for label, key in entry.get("type_badges", [])
+    ]
+    main.append(f'<span class="gr-age">{escape_html(entry.get("age") or "unknown age")}</span>')
+    if entry.get("reopened"):
+        main.append('<span class="gr-reopened">re-opened</span>')
+    reason_html = "".join(f'<div class="gr-reason">{escape_html(r)}</div>' for r in reasons)
+    data_text = " ".join([_display_title(entry), repo, *reasons])
+    return (
+        f'<div class="gr-item" data-type="{escape_html(" ".join(_badge_keys(entry)))}" '
+        f'data-age="{escape_html(bucket)}" data-repo="{escape_html(repo)}" '
+        f'data-text="{escape_html(data_text)}">'
+        f'<div class="gr-item-main">{"".join(main)}</div>{reason_html}</div>'
+    )
+
+
+def _render_group(group: dict, bucket: str) -> str:
+    """A collapsible repo group; collapsing works without JavaScript."""
+    repo = group.get("repo", "")
+    items = group.get("items", [])
+    rows = "".join(_render_item(entry, bucket) for entry in items)
+    return (
+        f'<details class="gr-repo" open data-repo="{escape_html(repo)}" '
+        f'data-age="{escape_html(bucket)}">'
+        f"<summary>{escape_html(repo or '(unknown repo)')} ({len(items)})</summary>"
+        f'<div class="gr-items">{rows}</div></details>'
+    )
+
+
+def _render_section(heading: str, groups: list[dict], bucket: str) -> str:
+    body = "".join(_render_group(group, bucket) for group in groups)
+    return f'<section class="gr-section"><h2>{escape_html(heading)}</h2>{body}</section>'
+
+
+def _render_chips(model: dict) -> str:
+    """Filter chips (decorative until Task 6): one per type key present, the
+    fixed age set, one per repo group — deduped in model order."""
+    type_chips: list[str] = []
+    seen_types: set[str] = set()
+    repo_chips: list[str] = []
+    seen_repos: set[str] = set()
+    for entry in _attention_items(model):
+        for label, key in entry.get("type_badges", []):
+            if key not in seen_types:
+                seen_types.add(key)
+                type_chips.append(
+                    f'<button type="button" class="gr-chip" data-dim="type" '
+                    f'data-val="{escape_html(key)}">{escape_html(label)}</button>'
+                )
+        repo = entry.get("repo", "")
+        if repo and repo not in seen_repos:
+            seen_repos.add(repo)
+            repo_chips.append(
+                f'<button type="button" class="gr-chip" data-dim="repo" '
+                f'data-val="{escape_html(repo)}">{escape_html(repo)}</button>'
+            )
+    age_chips = [
+        f'<button type="button" class="gr-chip" data-dim="age" data-val="{key}">'
+        f"{escape_html(label)}</button>"
+        for key, label in _AGE_CHIPS
+    ]
+    return f'<div class="gr-chips">{"".join(type_chips + age_chips + repo_chips)}</div>'
+
+
+def _render_attention(model: dict) -> str:
+    """Left column: search box, chips, New section, populated bucket
+    sections — or the empty-state card when nothing needs attention."""
+    att = model.get("attention") or {}
+    new_groups = (att.get("new") or {}).get("groups", [])
+    buckets = [b for b in att.get("buckets", []) if b.get("groups")]
+    if not new_groups and not buckets:
+        return '<div class="gr-card gr-empty">Nothing to show.</div>'
+    parts = [
+        '<input type="search" class="gr-search" placeholder="Filter\u2026" '
+        'aria-label="Filter attention items">',
+        _render_chips(model),
+        _render_section("New since last review", new_groups, "new"),
+    ]
+    parts += [
+        _render_section(
+            bucket.get("label", bucket.get("key", "")),
+            bucket.get("groups", []),
+            bucket.get("key", ""),
+        )
+        for bucket in buckets
+    ]
+    return "".join(parts)
+
+
+def _render_kpis(model: dict) -> str:
+    """Five always-rendered cards (including 0) with accent top-borders."""
+    kpi = model.get("kpi") or {}
+    cards = [
+        f'<div class="gr-kpi" data-kpi="{key}" style="border-top-color:{accent}">'
+        f'<span class="gr-kpi-value">{escape_html(kpi.get(key, 0))}</span>'
+        f'<span class="gr-kpi-label">{escape_html(label)}</span></div>'
+        for key, label, accent in _KPI_DEFS
+    ]
+    return f'<section class="gr-kpis" aria-label="Key numbers">{"".join(cards)}</section>'
+
+
+def _render_stale(model: dict) -> str:
+    names = ", ".join(sorted(model.get("stale_providers", [])))
+    if not names:
+        return ""
+    return (
+        '<div class="gr-banner gr-banner--warn" role="alert">'
+        f"Warning: these providers failed to fetch; their sections may be stale: "
+        f"{escape_html(names)}</div>"
+    )
+
+
+def _render_summary_card(model: dict) -> str:
+    """Inline CI/stale summaries derived at render time from the attention
+    items (badge keys, mirroring the KPI counts) — never filtered by the
+    Task 6 search/chips and never counted there."""
+
+    def _list(entries: list[dict]) -> str:
+        if not entries:
+            return '<p class="gr-muted">None.</p>'
+        rows = "".join(
+            f'<div class="gr-sum-item">'
+            f"{_anchor(e.get('url', ''), _display_title(e), 'gr-sum-title')}"
+            f'<span class="gr-age">{escape_html(e.get("age") or "unknown age")}</span></div>'
+            for e in entries
+        )
+        return f'<div class="gr-sum-list">{rows}</div>'
+
+    items = _attention_items(model)
+    ci = [e for e in items if "ci" in _badge_keys(e)]
+    stale = [e for e in items if "stale" in _badge_keys(e)]
+    return (
+        '<div class="gr-card"><h2>Needs summary</h2>'
+        "<h3>CI failures</h3>"
+        f"{_list(ci)}"
+        "<h3>Stale PRs</h3>"
+        f"{_list(stale)}</div>"
+    )
+
+
+def _render_activity_card(model: dict) -> str:
+    """Recent activity from the nested provider model. Providers without
+    renderable groups and groups without categories are skipped (the Task 3
+    empty a/b case); category labels come from the model. Titles are raw
+    provider text — escaped here."""
+    providers = [
+        p
+        for p in (model.get("activity") or {}).get("providers", [])
+        if any(g.get("categories") for g in p.get("groups", []))
+    ]
+    if not providers:
+        return ""
+    provider_blocks = []
+    for p in providers:
+        repo_blocks = []
+        for g in p.get("groups", []):
+            categories = g.get("categories") or []
+            if not categories:
+                continue
+            visibility = g.get("visibility") or ""
+            vis_html = (
+                f'<span class="gr-vis">{escape_html(visibility)}</span>' if visibility else ""
+            )
+            cat_blocks = []
+            for c in categories:
+                item_rows = "".join(
+                    f'<div class="gr-act-item">'
+                    f"{_anchor(i.get('url', ''), i.get('title', ''), 'gr-act-title')}"
+                    + (
+                        '<span class="gr-merged">→ merged, too</span>'
+                        if i.get("also_merged")
+                        else ""
+                    )
+                    + "</div>"
+                    for i in c.get("items", [])
+                )
+                label = c.get("label", c.get("key", ""))
+                cat_blocks.append(f'<div class="gr-act-cat">{escape_html(label)}</div>{item_rows}')
+            repo_blocks.append(
+                f'<div class="gr-act-repo"><div class="gr-act-repo-head">'
+                f"{escape_html(g.get('repo', ''))}{vis_html}</div>"
+                f"{''.join(cat_blocks)}</div>"
+            )
+        provider_blocks.append(
+            '<div class="gr-act-provider">'
+            f"<h3>{escape_html(p.get('label', p.get('provider', '')))}</h3>"
+            f"{''.join(repo_blocks)}</div>"
+        )
+    return f'<div class="gr-card"><h2>Recent activity</h2>{"".join(provider_blocks)}</div>'
+
+
+def render_dashboard_html(model: dict) -> str:
+    """The dark, self-contained dashboard page from the report model.
+
+    Header (title, coverage line with first-run suffix, "ages as of" caption,
+    status pill), the always-rendered KPI strip, the stale-provider banner,
+    then the two-column body: attention (search + chips + sections) left,
+    Needs summary + Recent activity right. Everything is static HTML — the
+    Task 6 script will read only the DOM and data-* attributes, so the model
+    JSON is never embedded in the page.
+    """
+    coverage = model.get("coverage") or {}
+    days = _coverage_days(coverage)
+    unit = "day" if days == 1 else "days"
+    coverage_line = (
+        f"Coverage: {_fmt_local(coverage.get('start', ''))} – "
+        f"{_fmt_local(coverage.get('end', ''))} ({days} {unit} since last review)"
+    )
+    if coverage.get("first_run"):
+        coverage_line += " (first run: last 24 hours)"
+
+    header = (
+        '<header class="gr-header">'
+        "<h1>GitReport digest</h1>"
+        f'<p class="gr-coverage">{escape_html(coverage_line)}</p>'
+        '<p class="gr-asof">ages as of '
+        f"{_fmt_local(model.get('generated_at', ''), with_time=True)}</p>"
+        + _status_pill(model)
+        + "</header>"
+    )
+    left = f'<div class="gr-col gr-col-left">{_render_attention(model)}</div>'
+    right = (
+        '<div class="gr-col gr-col-right">'
+        + _render_summary_card(model)
+        + _render_activity_card(model)
+        + "</div>"
+    )
+    body = (
+        header
+        + _render_stale(model)
+        + _render_kpis(model)
+        + f'<div class="gr-cols">{left}{right}</div>'
+    )
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "<title>GitReport digest</title>\n"
+        f"<style>{_DARK_CSS}</style>\n"
+        "</head>\n"
+        "<body>\n"
+        f"{body}\n"
+        "</body>\n"
+        "</html>\n"
+    )
