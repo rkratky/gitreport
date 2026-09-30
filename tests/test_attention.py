@@ -1,3 +1,4 @@
+import re
 import time
 from datetime import datetime
 
@@ -9,8 +10,9 @@ from gitreport.attention import (
     render_attention_body,
     render_attention_stdout,
     render_digest_markdown,
+    report_model,
 )
-from gitreport.providers.base import empty_repo_activity
+from gitreport.providers.base import empty_repo_activity, escape_user
 from gitreport.state import AttentionState, prune
 
 NOW = "2026-09-28T06:00:00+00:00"
@@ -317,38 +319,202 @@ def test_build_report_bucketing():
     assert [e["id"] for e in report["older"]] == ["gh:o"]
 
 
-def test_render_digest_markdown_shape():
-    state = state_with(last_reviewed="2026-09-27T06:00:00+00:00", items={})
-    md = render_digest_markdown(state, "# Git activity report", NOW, NOW, stale_providers=[])
+# --- digest renderers (Task 4: model-based, categorized markdown) ------------
+
+
+def _model(
+    items=None,
+    *,
+    first_run=False,
+    stale=(),
+    last_reviewed="2026-09-27T06:00:00+00:00",
+    coverage_start="2026-09-27T06:00:00+00:00",
+    activity=None,
+):
+    """A report_model digest for renderer tests."""
+    extra = {} if first_run else {"last_reviewed": last_reviewed}
+    return report_model(
+        _model_state(items or {}, **extra),
+        generated_at=NOW,
+        coverage_start=coverage_start,
+        first_run=first_run,
+        stale_providers=list(stale),
+        activity_data=activity,
+    )
+
+
+def test_render_digest_markdown_structure():
+    model = _model(
+        {
+            "gh:1": rec(
+                kinds=["ci_failure", "stale_pr"],
+                reasons=["3 unresolved comments"],
+                first_seen="2026-09-28T06:00:00+00:00",
+                last_updated=NOW,
+            ),
+            "gh:2": rec(
+                repo="o/r2",
+                first_seen="2026-09-01T06:00:00+00:00",
+                last_updated="2026-09-01T06:00:00+00:00",
+                reopen_count=1,
+            ),
+        }
+    )
+    md = render_digest_markdown(model)
+    # Front matter: raw UTC ISO values, byte-compatible with today.
     assert md.startswith("---\n")
     assert f"generated_at: {NOW}" in md
-    assert "Status: NOT YET REVIEWED" in md
-    assert "Coverage: " in md
+    assert "coverage_start: 2026-09-27T06:00:00+00:00" in md
+    # A single, line-anchored Status sentinel (recovery contract).
+    assert re.search(r"^Status: NOT YET REVIEWED", md, re.MULTILINE)
+    assert len([line for line in md.splitlines() if line.startswith("Status:")]) == 1
+    assert "## Needs attention" in md
+    # New tier first, repo groups beneath it.
+    assert "### New since last review" in md
+    assert re.search(r"^#### o/r$", md, re.MULTILINE)
+    # Still-open buckets by label; empty buckets omitted.
+    assert "### Still open — Last 30 days" in md
+    assert re.search(r"^#### o/r2$", md, re.MULTILINE)
+    assert "### Still open — Today" not in md
+    assert "### Still open — Last 7 days" not in md
+    assert "### Still open — Older" not in md
+    # Item lines: badges in precedence order, humanized age, re-opened marker.
+    assert "- [T](https://x/1) (CI, stale, today)" in md
+    assert "- [T](https://x/1) (mention, 3 weeks ago, re-opened)" in md
+    # Reason sub-lines indented beneath their item.
+    assert "\n  - 3 unresolved comments" in md
+    assert "## Recent activity" in md
+
+
+def test_render_digest_markdown_empty_state():
+    md = render_digest_markdown(_model({}))
+    assert "_Nothing needs your attention._" in md
+    assert "### New since last review" not in md
+    assert "### Still open" not in md
+    assert "## Recent activity" in md
+    assert "_No activity in the coverage window._" in md
+
+
+def test_render_digest_markdown_stale_warning():
+    md = render_digest_markdown(_model({}, stale=["launchpad", "github"]))
+    assert (
+        "Warning: these providers failed to fetch; "
+        "their sections may be stale: github, launchpad" in md
+    )
+
+
+def test_coverage_line_exact_format(monkeypatch):
+    monkeypatch.setattr(attention, "_fmt_local", lambda ts: "PINNED")
+    md = render_digest_markdown(_model({}))
+    assert "Coverage: PINNED – PINNED (1 day since last review)" in md
+    md2 = render_digest_markdown(
+        _model(
+            {},
+            coverage_start="2026-09-26T06:00:00+00:00",
+            last_reviewed="2026-09-26T06:00:00+00:00",
+        )
+    )
+    assert "Coverage: PINNED – PINNED (2 days since last review)" in md2
+
+
+def test_render_digest_markdown_first_run_coverage_suffix(monkeypatch):
+    monkeypatch.setattr(attention, "_fmt_local", lambda ts: "PINNED")
+    md = render_digest_markdown(_model({"gh:1": rec()}, first_run=True))
+    assert "Coverage: PINNED – PINNED (1 day since last review) (first run: last 24 hours)" in md
+    assert "(first run:" not in render_digest_markdown(_model({}))
+
+
+def test_render_digest_markdown_bad_timestamps_no_raise():
+    """R2-01 regression: unparseable coverage bounds must not raise (the old
+    datetime.min overflow when localised to a negative-offset timezone) —
+    the digest still renders, with days degraded to 1."""
+    model = _model(
+        {"gh:1": rec(first_seen=NOW, last_updated=NOW)},
+        last_reviewed="2026-09-29T00:00:00+00:00",
+    )
+    model["generated_at"] = "bad"
+    model["coverage"] = {"start": "bad", "end": "bad", "days": None, "first_run": False}
+    md = render_digest_markdown(model)
+    assert "## Needs attention" in md
+    assert "### Still open — Today" in md
+    assert "- [T](https://x/1)" in md
+    assert "(1 day since last review)" in md
+
+
+def test_render_digest_markdown_escapes_plain_text_titles():
+    model = _model(
+        {
+            "gh:1": rec(
+                title="Fix & ship <3",
+                reasons=["pinged [you]"],
+                first_seen="2026-09-28T06:00:00+00:00",
+            )
+        }
+    )
+    md = render_digest_markdown(model)
+    # The model carries plain text; escaping happens at render time only.
+    assert escape_user("Fix & ship <3") in md
+    assert escape_user("pinged [you]") in md
+    assert "[Fix & ship <3]" not in md
+
+
+def test_render_digest_markdown_unsafe_url_renders_plain_title():
+    model = _model(
+        {
+            "gh:1": rec(
+                title="Evil",
+                url="javascript:alert(1)",
+                first_seen="2026-09-28T06:00:00+00:00",
+            )
+        }
+    )
+    md = render_digest_markdown(model)
+    assert "- Evil (" in md
+    assert "javascript:" not in md
+
+
+def test_render_digest_markdown_activity_verbatim():
+    empty = empty_repo_activity("public")
+    empty["prs_submitted"].append({"title": "T", "url": "https://x/1"})
+    model = _model({}, activity={"github": {"o/r": empty}})
+    md = render_digest_markdown(model)
+    activity_md = model["activity"]["markdown"]
     assert "## Recent activity" in md
     assert "# Git activity report" in md
+    assert activity_md.strip() in md  # embedded byte-for-byte (stripped)
 
 
-def test_render_digest_markdown_bad_generated_at_no_raise():
-    # R2-01 regression: unparseable generated_at used to make build_report's
-    # clock fall back to datetime.min, which overflows when localised to a
-    # negative-offset timezone; the fallback must be a live "now" instead.
-    state = state_with(
-        last_reviewed="2026-09-29T00:00:00+00:00",
-        items={"gh:1": rec(first_seen=NOW, last_updated=NOW)},
-    )
-    md = render_digest_markdown(state, "x", "bad", "bad", [])
-    assert "## Needs attention" in md
-    assert "Still open" in md
-    assert "- [T](https://x/1)" in md
+def test_render_digest_markdown_reviewed_status_line(monkeypatch):
+    """The Status line renders per model.status. `read` normally restamps
+    the .md file in place, but a reviewed model must render the Reviewed
+    form (same display format as read's stamp)."""
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    model = _model({})
+    model["status"] = {"reviewed": True, "reviewed_at": NOW}
+    md = render_digest_markdown(model)
+    assert "Status: Reviewed Mon 28 Sep 06:00" in md
+    assert "NOT YET REVIEWED" not in md
 
 
 def test_render_attention_stdout_is_dry_view():
-    out = render_attention_stdout(
-        state_with(), stale_providers=["launchpad"], now=datetime.fromisoformat(NOW)
+    model = _model(
+        {"gh:1": rec(first_seen="2026-09-28T06:00:00+00:00")},
+        stale=["launchpad"],
     )
-    assert "# Needs attention" in out
+    out = render_attention_stdout(model)
+    assert out.startswith("# Needs attention\n\n")
+    assert "### New since last review" in out
     assert "launchpad" in out
+    # No front matter, no status/coverage lines, no activity section.
     assert "Status:" not in out
+    assert "Coverage:" not in out
+    assert "## Recent activity" not in out
+
+
+def test_render_attention_stdout_empty_model():
+    out = render_attention_stdout(_model({}))
+    assert out == "# Needs attention\n\n_Nothing needs your attention._\n"
 
 
 def test_z_suffix_same_instant_no_false_reopen():
@@ -504,18 +670,6 @@ def test_pinned_never_auto_resolves():
 # digest-level prune test lives in test_main.py.
 
 
-def test_coverage_line_exact_format(monkeypatch):
-    monkeypatch.setattr(attention, "_fmt_local", lambda ts: "PINNED")
-    md = render_digest_markdown(
-        state_with(), "# Git activity report", "2026-09-27T06:00:00+00:00", NOW, stale_providers=[]
-    )
-    assert "Coverage: PINNED – PINNED (1 day since last review)" in md
-    md2 = render_digest_markdown(
-        state_with(), "# Git activity report", "2026-09-26T06:00:00+00:00", NOW, stale_providers=[]
-    )
-    assert "Coverage: PINNED – PINNED (2 days since last review)" in md2
-
-
 def test_parse_garbage_returns_none():
     assert attention._parse("not-a-timestamp") is None
     assert attention._parse("") is None
@@ -573,51 +727,84 @@ def test_new_bucket_sorted_newest_first():
     assert [e["id"] for e in report["new"]] == ["gh:late", "gh:early"]
 
 
+def _entry(**overrides):
+    """A model-shaped attention item for hand-built body reports."""
+    base = {
+        "id": "gh:1",
+        "repo": "o/r",
+        "title": "T",
+        "url": "https://x/1",
+        "reasons": [],
+        "kinds": [],
+        "type_badges": [["item", "item"]],
+        "age": "2 days ago",
+        "age_bucket": "new",
+        "last_updated": NOW,
+        "reopened": False,
+    }
+    base.update(overrides)
+    return base
+
+
 def _report_with(entry):
-    return {"new": [entry], "today": [], "week": [], "month": [], "older": []}
+    """Flat body report for render_attention_body; the 'month' bucket key is
+    deliberately omitted — hand-built dicts may lack bucket keys."""
+    return {"new": [{"repo": "o/r", "items": [entry]}], "today": [], "week": [], "older": []}
+
+
+def test_render_attention_body_item_suffix_and_reasons():
+    entry = _entry(
+        type_badges=[["CI", "ci"], ["stale", "stale"]],
+        age="today",
+        reopened=True,
+        reasons=["3 unresolved comments"],
+    )
+    out = render_attention_body(_report_with(entry), [])
+    assert "- [T](https://x/1) (CI, stale, today, re-opened)" in out
+    assert "\n  - 3 unresolved comments" in out
+
+
+def test_render_attention_body_bucket_groups():
+    report = {
+        "new": [],
+        "week": [{"repo": "o/r", "items": [_entry()]}],
+        "older": [{"repo": "a/b", "items": [_entry(title="U", url="", age="1 month ago")]}],
+    }
+    out = render_attention_body(report, [])
+    assert "### Still open — Last 7 days" in out
+    assert "#### o/r" in out
+    assert "### Still open — Older" in out
+    assert "#### a/b" in out
+    assert "- U (item, 1 month ago)" in out
 
 
 def test_url_guard_javascript_scheme_no_link():
-    entry = {"id": "gh:1", "title": "Evil", "url": "javascript:alert(1)", "reasons": []}
+    entry = _entry(title="Evil", url="javascript:alert(1)")
     out = render_attention_body(_report_with(entry), [])
     assert "- Evil" in out
     assert "javascript:" not in out
 
 
 def test_url_guard_parens_no_link():
-    entry = {
-        "id": "gh:1",
-        "title": "Odd",
-        "url": "https://example.com/a(b) [x]",
-        "reasons": [],
-    }
+    entry = _entry(title="Odd", url="https://example.com/a(b) [x]")
     out = render_attention_body(_report_with(entry), [])
     assert "- Odd" in out
     assert "](https://example.com" not in out
 
 
 def test_url_guard_unbalanced_paren_no_link():
-    entry = {
-        "id": "gh:1",
-        "title": "Odd",
-        "url": "https://example.com/a)b",
-        "reasons": [],
-    }
+    entry = _entry(title="Odd", url="https://example.com/a)b")
     out = render_attention_body(_report_with(entry), [])
     assert "- Odd" in out
     assert "](https://example.com" not in out
 
 
-def test_titles_not_re_escaped():
-    entry = {
-        "id": "gh:1",
-        "title": "Fix &amp; ship &lt;3",
-        "url": "https://example.com/1",
-        "reasons": [],
-    }
+def test_titles_escaped_at_render():
+    entry = _entry(title="Fix & ship <3", url="https://example.com/1", reasons=["a [b] c"])
     out = render_attention_body(_report_with(entry), [])
-    assert "Fix &amp; ship &lt;3" in out
-    assert "&amp;amp;" not in out
+    assert escape_user("Fix & ship <3") in out
+    assert escape_user("a [b] c") in out
+    assert "Fix & ship <3" not in out
 
 
 def test_humanize_age_today_yesterday_pinned_utc(monkeypatch):

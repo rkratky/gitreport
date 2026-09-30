@@ -4,8 +4,13 @@ import copy
 import re
 from datetime import UTC, datetime, timedelta
 
-from .providers.base import unescape_user
-from .reporting import ACTIVITY_CATEGORIES, PROVIDER_DISPLAY_NAMES, PROVIDER_LABELS
+from .providers.base import escape_user, unescape_user
+from .reporting import (
+    ACTIVITY_CATEGORIES,
+    PROVIDER_DISPLAY_NAMES,
+    PROVIDER_LABELS,
+    generate_report,
+)
 from .state import AttentionState, ItemState
 
 MAX_REASONS = 10
@@ -544,9 +549,6 @@ def report_model(
     }
 
     if activity_data is not None:
-        # Lazy import: keeps .reporting out of the module import graph.
-        from .reporting import generate_report
-
         activity = {
             "markdown": generate_report(activity_data),
             "providers": activity_model(activity_data)["providers"],
@@ -579,34 +581,81 @@ def _fmt_local(ts: str) -> str:
     return f"{dt:%a} {dt.day} {dt:%b}"
 
 
-def _entry_line(entry: dict) -> str:
-    title = entry.get("title") or entry["id"]
+def _status_line(model: dict) -> str:
+    """The single line-anchored Status sentinel (recovery contract: only
+    this line may start a digest line with "Status:"). Rendered per
+    model.status — `read` normally restamps the .md file in place instead."""
+    status = model.get("status") or {}
+    if status.get("reviewed"):
+        at = _parse(status.get("reviewed_at") or "")
+        if at is not None:
+            local = at.astimezone()
+            return f"Status: Reviewed {local:%a} {local.day} {local:%b} {local:%H:%M}"
+        return "Status: Reviewed"
+    return "Status: NOT YET REVIEWED — run `gitreport read` after reviewing"
+
+
+def _coverage_days(coverage: dict) -> int:
+    """Digest coverage days: the model's stored value. Hand-built models may
+    omit it; degrade exactly like report_model (unparseable bounds -> 1)."""
+    days = coverage.get("days")
+    if isinstance(days, int) and not isinstance(days, bool) and days >= 1:
+        return days
+    start_dt, end_dt = _parse(coverage.get("start")), _parse(coverage.get("end"))
+    if start_dt is None or end_dt is None:
+        return 1
+    return max(1, (end_dt - start_dt).days)
+
+
+def _render_item_line(entry: dict) -> str:
+    """One digest item: [title](url) (badge labels, age, re-opened) with
+    reason lines indented beneath. Titles/reasons are plain text in the
+    model; escaping happens here, at render time. The model's URL is already
+    scheme-guarded (unsafe -> ""), and the guard runs again so a link only
+    ever renders for a URL safe for the [title](url) syntax."""
+    title = escape_user(entry.get("title") or entry["id"])
     safe_url = _safe_url(entry.get("url", ""))
     if safe_url:
         line = f"- [{title}]({safe_url})"
     else:
         line = f"- {title}"
-    if entry.get("reopen_count"):
-        line += " (re-opened)"
+    suffix = [badge[0] for badge in entry.get("type_badges", [])]
+    suffix.append(entry.get("age") or "unknown age")
+    if entry.get("reopened"):
+        suffix.append("re-opened")
+    line += f" ({', '.join(suffix)})"
     for reason in entry.get("reasons", []):
-        line += f"\n  - {reason}"
+        line += f"\n  - {escape_user(reason)}"
     return line
 
 
-def render_attention_body(report: dict, stale_providers: list[str]) -> str:
+def _render_groups(groups: list[dict]) -> list[str]:
+    """`#### <repo>` blocks for one tier/bucket, in model order."""
     lines: list[str] = []
-    if report["new"]:
+    for group in groups:
+        lines += [f"#### {group['repo']}", ""]
+        lines += [_render_item_line(entry) for entry in group.get("items", [])]
+        lines.append("")
+    return lines
+
+
+def render_attention_body(report: dict, stale_providers: list[str]) -> str:
+    """The categorized body: a flat mapping of bucket key (`new` plus the
+    BUCKETS keys) -> repo groups. Hand-built reports may omit keys; empty
+    tiers, buckets and groups are omitted; the empty state and the
+    stale-provider warning keep today's wording."""
+    lines: list[str] = []
+    new_groups = report.get("new", [])
+    if new_groups:
         lines += ["### New since last review", ""]
-        lines += [_entry_line(e) for e in report["new"]]
-        lines.append("")
+        lines += _render_groups(new_groups)
     for bucket in BUCKETS:
-        entries = report[bucket]
-        if not entries:
-            continue
+        groups = report.get(bucket, [])
+        if not groups:
+            continue  # empty buckets are omitted
         lines += [f"### Still open — {BUCKET_TITLES[bucket]}", ""]
-        lines += [_entry_line(e) for e in entries]
-        lines.append("")
-    if not report["new"] and not any(report[b] for b in BUCKETS):
+        lines += _render_groups(groups)
+    if not new_groups and not any(report.get(b) for b in BUCKETS):
         lines += ["_Nothing needs your attention._", ""]
     if stale_providers:
         names = ", ".join(sorted(stale_providers))
@@ -617,51 +666,64 @@ def render_attention_body(report: dict, stale_providers: list[str]) -> str:
     return "\n".join(lines)
 
 
-def render_attention_stdout(state: dict, stale_providers: list[str], now: datetime) -> str:
-    """Dry-run attention view (no state machinery, no front matter)."""
-    report = build_report(state, now)
-    return "# Needs attention\n\n" + render_attention_body(report, stale_providers)
+def _attention_flat(model: dict) -> dict:
+    """Flatten the model's attention section into the body renderer's
+    bucket-key -> repo-groups mapping (new tier + populated buckets)."""
+    att = model.get("attention", {})
+    flat: dict = {}
+    new_groups = (att.get("new") or {}).get("groups", [])
+    if new_groups:
+        flat["new"] = new_groups
+    for bucket in att.get("buckets", []):
+        if bucket.get("groups"):
+            flat[bucket["key"]] = bucket["groups"]
+    return flat
 
 
-def render_digest_markdown(
-    state: dict,
-    activity_markdown: str,
-    coverage_start: str,
-    generated_at: str,
-    stale_providers: list[str],
-) -> str:
-    start_dt = _parse(coverage_start)
-    end_dt = _parse(generated_at)
-    if start_dt is None or end_dt is None:
-        days = 1  # defensive: unparseable coverage bounds degrade to 1 day
-    else:
-        days = max(1, (end_dt - start_dt).days)
+def render_attention_stdout(model: dict) -> str:
+    """Dry-run attention view: `# Needs attention` plus the categorized
+    body only — no front matter, no status/coverage lines."""
+    return "# Needs attention\n\n" + render_attention_body(
+        _attention_flat(model), model.get("stale_providers", [])
+    )
+
+
+def render_digest_markdown(model: dict) -> str:
+    """The categorized Markdown digest from the report model.
+
+    Front matter, coverage line and the Status sentinel keep today's byte
+    formats (recovery contract); `## Recent activity` embeds the model's
+    activity Markdown verbatim. The coverage line gains the first-run
+    suffix when model.coverage.first_run is set.
+    """
+    coverage = model["coverage"]
+    start = coverage.get("start", "")
+    days = _coverage_days(coverage)
     unit = "day" if days == 1 else "days"
-    coverage = (
-        f"Coverage: {_fmt_local(coverage_start)} – {_fmt_local(generated_at)} "
+    coverage_line = (
+        f"Coverage: {_fmt_local(start)} – {_fmt_local(coverage.get('end', ''))} "
         f"({days} {unit} since last review)"
     )
-    # An unparseable generated_at is a programming error; degrade the report
-    # clock to a live "now" (datetime.min would overflow once localised to a
-    # negative-offset timezone).
-    report = build_report(state, end_dt if end_dt is not None else datetime.now(UTC))
+    if coverage.get("first_run"):
+        coverage_line += " (first run: last 24 hours)"
+    activity_md = (model.get("activity", {}).get("markdown") or "").strip()
     lines = [
         "---",
-        f"generated_at: {generated_at}",
-        f"coverage_start: {coverage_start}",
+        f"generated_at: {model['generated_at']}",
+        f"coverage_start: {start}",
         "---",
         "",
         "# GitReport digest",
         "",
-        coverage,
-        "Status: NOT YET REVIEWED — run `gitreport read` after reviewing",
+        coverage_line,
+        _status_line(model),
         "",
         "## Needs attention",
         "",
-        render_attention_body(report, stale_providers),
+        render_attention_body(_attention_flat(model), model.get("stale_providers", [])),
         "## Recent activity",
         "",
-        activity_markdown.strip() or "_No activity in the coverage window._",
+        activity_md or "_No activity in the coverage window._",
         "",
     ]
     return "\n".join(lines)

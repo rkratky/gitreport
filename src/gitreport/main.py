@@ -14,6 +14,7 @@ from .attention import (
     merge_into_state,
     render_attention_stdout,
     render_digest_markdown,
+    report_model,
 )
 from .config import load_config
 from .html_report import render_html, replace_status_line, strip_front_matter
@@ -257,10 +258,18 @@ def attention(config_path_str):
     merged = dedupe(results)
     # Dry-run view: overlay merged items on the state without persisting.
     # ok_providers stays empty so nothing resolves by absence in the view.
+    generated_at = _now_iso()
     view = merge_into_state(
-        {**state.model_dump(), "last_digest_run": None}, merged, set(), _now_iso()
+        {**state.model_dump(), "last_digest_run": None}, merged, set(), generated_at
     )
-    click.echo(render_attention_stdout(view, stale, datetime.now(UTC)))
+    model = report_model(
+        AttentionState.model_validate(view),
+        generated_at=generated_at,
+        coverage_start=_attention_since(state).isoformat(),
+        first_run=not (state.last_reviewed and _parse(state.last_reviewed) is not None),
+        stale_providers=stale,
+    )
+    click.echo(render_attention_stdout(model))
 
 
 @cli.command()
@@ -292,8 +301,13 @@ def digest(config_path_str, open_browser, catch_up):
     # Snapshot for fetches (outside the lock; non-mutating read).
     pre_state = load_state_snapshot(att.state_path)
     generated_at = datetime.now(UTC).isoformat()
+    # First run = no usable cursor anywhere: the state's last_reviewed is
+    # unset/unparseable AND the digest-scan recovery below found nothing —
+    # the recovered-candidate path mirrors `since` (a recovered cursor means
+    # coverage continues, not a 24h first run).
     if is_state_loadable(att.state_path):
         since = _attention_since(pre_state)
+        first_run = not (pre_state.last_reviewed and _parse(pre_state.last_reviewed) is not None)
     else:
         # R2: the snapshot of a corrupt state is empty, so the 24h first-run
         # fallback would collapse coverage. The digest files still record the
@@ -301,9 +315,9 @@ def digest(config_path_str, open_browser, catch_up):
         # under-lock rebuild+recovery below stays authoritative for the
         # saved state.
         recovered = _recover_last_reviewed_candidate(att.digest_output)
-        since = _parse(recovered) if recovered else None
-        if since is None:
-            since = _attention_since(pre_state)
+        recovered_dt = _parse(recovered) if recovered else None
+        since = recovered_dt or _attention_since(pre_state)
+        first_run = recovered_dt is None
     state_items = {mid: rec.model_dump() for mid, rec in pre_state.items.items()}
     results, stale = _fetch_attention(
         providers, since, att.exclusions, state_items, att.stale_pr_days
@@ -331,15 +345,15 @@ def digest(config_path_str, open_browser, catch_up):
         # R6: a provider can be stale in both fetch lists (e.g. a constructor
         # failure); dedupe so the warning names each provider once.
         stale = sorted(set(stale) | set(activity_stale))
-        activity_md = generate_report(activity_data)
-        coverage_start = since.isoformat()
-        md_text = render_digest_markdown(
-            new_state_obj.model_dump(),
-            activity_md,
-            coverage_start,
-            generated_at,
-            stale,
+        model = report_model(
+            new_state_obj,
+            generated_at=generated_at,
+            coverage_start=since.isoformat(),
+            first_run=first_run,
+            stale_providers=stale,
+            activity_data=activity_data,
         )
+        md_text = render_digest_markdown(model)
         stem = Path(
             str(att.digest_output).replace(
                 "YYYY-MM-DD", datetime.now().astimezone().strftime("%Y-%m-%d")
