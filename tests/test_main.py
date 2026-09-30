@@ -290,12 +290,17 @@ def _seed_item(item_id, **overrides):
     return ItemState(**defaults)
 
 
-def _config_with(state_path, stem, latest, providers=None):
+def _config_with(state_path, stem, latest, providers=None, formats=None):
     from gitreport.config import AttentionConfig, Config, ProviderConfig
 
     return Config(
         providers=providers or {"mock": ProviderConfig(username="u", token="t")},
-        attention=AttentionConfig(state_path=state_path, digest_output=stem, digest_latest=latest),
+        attention=AttentionConfig(
+            state_path=state_path,
+            digest_output=stem,
+            digest_latest=latest,
+            digest_formats=formats or ["html", "md"],
+        ),
     )
 
 
@@ -722,7 +727,7 @@ def test_read_does_not_move_cursor_back(mock_load_config, tmp_path):
 @patch("gitreport.main.load_config")
 def test_read_survives_unparseable_last_reviewed(mock_load_config, tmp_path):
     """R8: a garbage last_reviewed must not wedge `read` — it counts as
-    never-reviewed (build_report's convention), so the newest digest is
+    never-reviewed (report_model's convention), so the newest digest is
     restamped and the cursor moves to its generated_at."""
     from gitreport.state import save_state
 
@@ -1154,3 +1159,297 @@ def test_digest_without_catch_up_always_runs(mock_load_config, tmp_path_factory)
 
     assert result.exit_code == 0, result.output
     assert NoopProvider.get_attention.call_count == 1
+
+
+# --- Task 7: dashboard artifact wiring (.json snapshot, read re-render) ------
+
+
+class CategorizedProvider(GitProvider):
+    """Provider whose attention fetch yields a review request and a mention."""
+
+    get_activity = MagicMock()
+    get_attention = MagicMock(
+        return_value={
+            "ok": True,
+            "items": [
+                {
+                    "id": "gh:https://github.com/o/r/pull/1",
+                    "provider": "github",
+                    "kind": "review_requested",
+                    "origin": "notification",
+                    "repo": "o/r",
+                    "title": "PR one",
+                    "url": "https://github.com/o/r/pull/1",
+                    "reason": "review requested",
+                    "updated_at": "2026-09-28T05:00:00+00:00",
+                    "thread_url": None,
+                },
+                {
+                    "id": "gh:https://github.com/o/r2/issue/2",
+                    "provider": "github",
+                    "kind": "mention",
+                    "origin": "query",
+                    "repo": "o/r2",
+                    "title": "Issue two",
+                    "url": "https://github.com/o/r2/issue/2",
+                    "reason": "mentioned you",
+                    "updated_at": "2026-09-28T05:30:00+00:00",
+                    "thread_url": None,
+                },
+            ],
+            "resolved_ids": [],
+            "error": None,
+        }
+    )
+
+    def __init__(self, username, token):
+        pass
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_writes_json_snapshot_without_symlink(mock_load_config, tmp_path_factory):
+    """Every digest run writes the .md/.json/.html artifacts; the .json is
+    renderer infrastructure: never symlinked as latest.json."""
+    tmp = tmp_path_factory.mktemp("json-artifact")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp / "digests" / "2026-09-28.md").exists()
+    assert (tmp / "digests" / "2026-09-28.html").exists()
+    model = json.loads((tmp / "digests" / "2026-09-28.json").read_text())
+    assert model["schema_version"] == 1
+    assert model["status"] == {"reviewed": False, "reviewed_at": None}
+    assert not (tmp / "digests" / "latest.json").exists()
+    assert not (tmp / "digests" / "latest.json").is_symlink()
+    assert (tmp / "digests" / "latest.md").is_symlink()
+    assert (tmp / "digests" / "latest.html").is_symlink()
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_digest_md_only_writes_json_but_no_html(mock_load_config, tmp_path_factory):
+    """With `md` the only configured format, .md + .json are still written
+    (the snapshot is infrastructure) but no .html artifact or symlink."""
+    tmp = tmp_path_factory.mktemp("md-only")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+        formats=["md"],
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp / "digests" / "2026-09-28.md").exists()
+    assert (tmp / "digests" / "2026-09-28.json").exists()
+    assert not (tmp / "digests" / "2026-09-28.html").exists()
+    assert not (tmp / "digests" / "latest.html").exists()
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": CategorizedProvider})
+def test_digest_stdout_is_categorized_markdown(mock_load_config, tmp_path_factory):
+    """The digest stdout mirrors the dashboard: repo groups under `####` and
+    per-item type tags in badge precedence order."""
+    tmp = tmp_path_factory.mktemp("categorized")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["digest"])
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"^#### o/r$", result.output, re.MULTILINE)
+    assert re.search(r"^#### o/r2$", result.output, re.MULTILINE)
+    assert "(PR review" in result.output
+    assert "(mention" in result.output
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_read_flips_json_status_and_rerenders_dashboard(mock_load_config, tmp_path_factory):
+    """read advances the sibling .json's status and re-renders the .html from
+    the model; only the status banner line differs from the pre-read HTML."""
+    tmp = tmp_path_factory.mktemp("read-rerender")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+
+    runner = CliRunner()
+    digest_result = runner.invoke(cli, ["digest"])
+    assert digest_result.exit_code == 0, digest_result.output
+    html_path = tmp / "digests" / "2026-09-28.html"
+    before = html_path.read_text()
+
+    result = runner.invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    md_text = (tmp / "digests" / "2026-09-28.md").read_text()
+    assert "Status: Reviewed" in md_text
+    model = json.loads((tmp / "digests" / "2026-09-28.json").read_text())
+    assert model["schema_version"] == 1
+    assert model["status"]["reviewed"] is True
+    assert model["status"]["reviewed_at"]
+    html_text = html_path.read_text()
+    assert "Reviewed" in html_text
+    assert "NOT YET REVIEWED" not in html_text
+    # Banner-only byte diff: every line outside the status pill is unchanged.
+    before_body = [line for line in before.splitlines() if "gr-status" not in line]
+    after_body = [line for line in html_text.splitlines() if "gr-status" not in line]
+    assert before_body == after_body
+
+
+def _write_digest_files(directory, day_stem, generated_at):
+    """Write one complete .md/.json/.html artifact set, as a digest run would."""
+    from gitreport.attention import render_digest_markdown, report_model
+    from gitreport.html_report import atomic_write_text, render_dashboard_html
+
+    model = report_model(
+        AttentionState(),
+        generated_at=generated_at,
+        coverage_start="2026-09-20T06:00:00+00:00",
+        first_run=True,
+        stale_providers=[],
+    )
+    stem = directory / day_stem
+    atomic_write_text(stem.with_name(stem.name + ".md"), render_digest_markdown(model))
+    atomic_write_text(stem.with_name(stem.name + ".json"), json.dumps(model, indent=2))
+    atomic_write_text(stem.with_name(stem.name + ".html"), render_dashboard_html(model))
+    return stem
+
+
+@patch("gitreport.main.load_config")
+def test_read_multi_target_updates_every_newer_digest(mock_load_config, tmp_path):
+    """With two digests newer than the cursor, read processes each target
+    independently: both .mds restamped, both .jsons flipped, both .htmls
+    re-rendered."""
+    from gitreport.state import save_state
+
+    tmp = tmp_path
+    (tmp / "digests").mkdir()
+    _write_digest_files(tmp / "digests", "2026-09-26", "2026-09-26T06:00:00+00:00")
+    _write_digest_files(tmp / "digests", "2026-09-28", "2026-09-28T06:00:00+00:00")
+    save_state(
+        tmp / "state.json",
+        AttentionState(last_reviewed="2026-09-25T06:00:00+00:00"),
+    )
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "YYYY-MM-DD",
+        latest=tmp / "digests" / "latest",
+    )
+
+    result = CliRunner().invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    for day in ("2026-09-26", "2026-09-28"):
+        md_text = (tmp / "digests" / f"{day}.md").read_text()
+        assert "Status: Reviewed" in md_text
+        assert "NOT YET REVIEWED" not in md_text
+        model = json.loads((tmp / "digests" / f"{day}.json").read_text())
+        assert model["status"]["reviewed"] is True
+        assert model["status"]["reviewed_at"]
+        assert "NOT YET REVIEWED" not in (tmp / "digests" / f"{day}.html").read_text()
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_read_html_disabled_never_touches_html(mock_load_config, tmp_path_factory):
+    """With html disabled, digest writes .md/.json only and read still flips
+    the .json status — but never creates or updates a .html artifact."""
+    tmp = tmp_path_factory.mktemp("read-nohtml")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+        formats=["md"],
+    )
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["digest"]).exit_code == 0
+    html_path = tmp / "digests" / "2026-09-28.html"
+    assert not html_path.exists()
+
+    result = runner.invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    assert not html_path.exists()
+    model = json.loads((tmp / "digests" / "2026-09-28.json").read_text())
+    assert model["status"]["reviewed"] is True
+
+
+@patch("gitreport.main.load_config")
+def test_read_missing_json_uses_legacy_fallback(mock_load_config, tmp_path):
+    """Pre-upgrade digests carry no .json: read restamps the .md and re-renders
+    the .html through the legacy Markdown conversion (without fabricating a
+    .json snapshot)."""
+    from gitreport.state import save_state
+
+    tmp = tmp_path
+    stem = tmp / "digests" / "2026-09-28"
+    (tmp / "digests").mkdir()
+    (tmp / "digests" / "2026-09-28.md").write_text(
+        "---\n"
+        "generated_at: 2026-09-28T06:00:00+00:00\n"
+        "coverage_start: 2026-09-20T06:00:00+00:00\n"
+        "---\n\n"
+        "# GitReport digest\n\n"
+        "Status: NOT YET REVIEWED — run `gitreport read` after reviewing\n"
+    )
+    (tmp / "digests" / "2026-09-28.html").write_text("LEGACY-OLD-HTML")
+    save_state(tmp / "state.json", AttentionState())
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json", stem=stem, latest=tmp / "digests" / "latest"
+    )
+
+    result = CliRunner().invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    md_text = (tmp / "digests" / "2026-09-28.md").read_text()
+    assert "Status: Reviewed" in md_text
+    html_text = (tmp / "digests" / "2026-09-28.html").read_text()
+    assert "LEGACY-OLD-HTML" not in html_text
+    assert "Status: Reviewed" in html_text
+    assert "NOT YET REVIEWED" not in html_text
+    assert not (tmp / "digests" / "2026-09-28.json").exists()
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_read_corrupt_json_warns_and_restamps_md_only(mock_load_config, tmp_path_factory):
+    """An unusable .json (schema_version != 1) must not crash read: warn, keep
+    the .json and .html untouched, restamp the .md only."""
+    tmp = tmp_path_factory.mktemp("read-corrupt")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["digest"]).exit_code == 0
+    corrupt = {"schema_version": 99}
+    json_path = tmp / "digests" / "2026-09-28.json"
+    json_path.write_text(json.dumps(corrupt))
+    pre_html = (tmp / "digests" / "2026-09-28.html").read_text()
+
+    result = runner.invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.output
+    assert "schema_version" in result.output
+    assert "Status: Reviewed" in (tmp / "digests" / "2026-09-28.md").read_text()
+    assert json.loads(json_path.read_text()) == corrupt
+    assert (tmp / "digests" / "2026-09-28.html").read_text() == pre_html

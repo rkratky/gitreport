@@ -36,6 +36,28 @@ class AttentionConfig(BaseModel):
     def _validate_formats(self) -> "AttentionConfig":
         if "md" not in self.digest_formats:
             raise ValueError("`gitreport read` requires the `md` digest format")
+        # S19: digest_formats is the closed set {html, md}. "json" in
+        # particular is forbidden: the .json model snapshot is renderer
+        # infrastructure (always written, never symlinked).
+        unknown = sorted(set(self.digest_formats) - {"html", "md"})
+        if unknown:
+            raise ValueError(
+                f"digest_formats only supports html and md (got: {', '.join(unknown)})"
+            )
+        # S19: a digest artifact path resolving onto the state store would let
+        # a digest run overwrite it — reject the collision. Paths are compared
+        # on expanduser'd copies (load_config anchors still-relative paths
+        # afterwards; equality is anchor-independent when both sides share a
+        # base, and a ~-expanded path can never equal a bare relative one).
+        state = self.state_path.expanduser()
+        stem = self.digest_output.expanduser()
+        for ext in ("json", "md", "html"):
+            artifact = stem.with_name(stem.name + "." + ext)
+            if artifact == state:
+                raise ValueError(
+                    "digest/state path collision: digest_output's "
+                    f".{ext} artifact ({artifact}) equals state_path"
+                )
         return self
 
 

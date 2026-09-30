@@ -140,3 +140,54 @@ def test_attention_md_format_required(tmp_path: Path):
 
     with pytest.raises(ValueError, match="requires the .md. digest format"):
         load_config(config_file)
+
+
+def test_digest_formats_reject_unknown_value(tmp_path: Path):
+    """S19: digest_formats is a closed set {html, md} — e.g. `json` is
+    forbidden (the snapshot has no symlink and is not user-configurable)."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {"digest_formats": ["html", "md", "json"]},
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    with pytest.raises(ValueError, match="digest_formats"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize("ext", ["json", "md", "html"])
+def test_digest_output_state_path_collision_rejected(tmp_path: Path, ext: str):
+    """S19: a digest artifact path that resolves onto state_path would let a
+    digest run overwrite the state store — the config must be rejected."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": f"digests/YYYY-MM-DD.{ext}",
+            "digest_output": "digests/YYYY-MM-DD",
+            "digest_latest": "digests/latest",
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    with pytest.raises(ValueError, match="collision"):
+        load_config(config_file)
+
+
+def test_digest_output_state_path_no_collision(tmp_path: Path):
+    """The default-ish layout (state.json next to dated digest stems) is fine."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": "state/state.json",
+            "digest_output": "digests/YYYY-MM-DD",
+            "digest_latest": "digests/latest",
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    config = load_config(config_file)
+
+    assert config.attention.state_path == tmp_path / "state" / "state.json"

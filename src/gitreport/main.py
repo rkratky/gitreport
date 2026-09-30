@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import webbrowser
@@ -17,7 +18,13 @@ from .attention import (
     report_model,
 )
 from .config import load_config
-from .html_report import render_html, replace_status_line, strip_front_matter
+from .html_report import (
+    atomic_write_text,
+    render_dashboard_html,
+    render_html,
+    replace_status_line,
+    strip_front_matter,
+)
 from .providers.base import GitProvider
 from .providers.github import GitHubProvider
 from .providers.launchpad import LaunchpadProvider
@@ -360,9 +367,13 @@ def digest(config_path_str, open_browser, catch_up):
             )
         )
         stem.parent.mkdir(parents=True, exist_ok=True)
-        _stem_file(stem, "md").write_text(md_text)
+        # All three artifacts are written atomically (tmp + os.replace); the
+        # .json model snapshot is renderer infrastructure: always written,
+        # never symlinked (config validation forbids "json" in digest_formats).
+        atomic_write_text(_stem_file(stem, "md"), md_text)
+        atomic_write_text(_stem_file(stem, "json"), json.dumps(model, indent=2))
         if "html" in att.digest_formats:
-            _stem_file(stem, "html").write_text(render_html(md_text))
+            atomic_write_text(_stem_file(stem, "html"), render_dashboard_html(model))
         _refresh_symlinks(stem, att.digest_latest, att.digest_formats)
 
     click.echo(strip_front_matter(md_text)[1])
@@ -387,7 +398,7 @@ def read(config_path_str, open_browser):
         if rebuilt:
             _recover_last_reviewed(state, att.digest_output)
         previous = state.last_reviewed
-        # R8: an unparseable cursor counts as never-reviewed (build_report's
+        # R8: an unparseable cursor counts as never-reviewed (report_model's
         # convention) — a garbage cursor must not wedge `read` (no targets,
         # no restamp, cursor never moves).
         previous_dt = _parse(previous) if previous else None
@@ -422,9 +433,10 @@ def read(config_path_str, open_browser):
         for path in targets:
             text = path.read_text()
             stamped = replace_status_line(text, stamp)
+            # The restamp always happens first and is never gated on the
+            # sibling .json's usability (spec: never fail the command).
             path.write_text(stamped)
-            if path.suffix == ".md" and "html" in att.digest_formats:
-                _stem_file(path.with_suffix(""), "html").write_text(render_html(stamped))
+            _advance_digest_artifacts(path, stamped, now, "html" in att.digest_formats)
     if open_browser:
         ext = "html" if "html" in att.digest_formats else "md"
         _open_in_browser(_stem_file(att.digest_latest, ext))
@@ -565,6 +577,87 @@ def _stem_file(stem: Path, ext: str) -> Path:
     LAST dot, collapsing a dot-containing stem (`daily.report-2026-09-28`)
     to `daily.md`; appending to the name keeps the full stem intact."""
     return stem.with_name(stem.name + "." + ext)
+
+
+# Top-level keys a .json snapshot must carry to be usable for the read
+# re-render (the report model's own shape; extra keys are tolerated for
+# forward compatibility).
+_DIGEST_MODEL_KEYS = (
+    "schema_version",
+    "generated_at",
+    "status",
+    "coverage",
+    "attention",
+    "kpi",
+    "activity",
+    "stale_providers",
+)
+
+
+def _load_digest_model(json_path: Path, md_generated_at: str) -> dict | None:
+    """Load and validate the sibling .json snapshot of a digest .md.
+
+    Returns the model dict when usable for the read re-render, else None
+    (with a stderr warning) when unusable: a JSON decode error, a non-object
+    document, schema_version != 1, any missing required top-level key, or a
+    generated_at differing from the .md front matter.
+    """
+    try:
+        model = json.loads(json_path.read_text())
+    except json.JSONDecodeError as e:
+        click.echo(
+            f"Warning: {json_path} is corrupt ({e}); restamping the Markdown only.",
+            err=True,
+        )
+        return None
+    problems: list[str] = []
+    if not isinstance(model, dict):
+        problems.append("not a JSON object")
+    else:
+        if model.get("schema_version") != 1:
+            problems.append(f"unsupported schema_version {model.get('schema_version')!r}")
+        missing = [key for key in _DIGEST_MODEL_KEYS if key not in model]
+        if missing:
+            problems.append(f"missing key(s): {', '.join(missing)}")
+        if model.get("generated_at") != md_generated_at:
+            problems.append("generated_at does not match the Markdown front matter")
+    if problems:
+        click.echo(
+            f"Warning: {json_path} is unusable ({'; '.join(problems)}); "
+            "restamping the Markdown only.",
+            err=True,
+        )
+        return None
+    return model
+
+
+def _advance_digest_artifacts(path: Path, stamped_md: str, reviewed_at: str, html_enabled: bool):
+    """Post-restamp artifact update for one target digest .md (under the
+    state lock).
+
+    - missing .json (pre-upgrade digest): legacy fallback — re-convert the
+      restamped Markdown via render_html when html is enabled; no .json is
+      fabricated;
+    - unusable .json: warned about (and ignored) by _load_digest_model — the
+      .md-only restamp already happened;
+    - usable: the model's status advances to reviewed (atomic rewrite) and
+      the .html re-renders from the model via render_dashboard_html when
+      html is enabled.
+    """
+    stem = path.with_suffix("")
+    json_path = _stem_file(stem, "json")
+    if not json_path.exists():
+        if html_enabled:
+            atomic_write_text(_stem_file(stem, "html"), render_html(stamped_md))
+        return
+    meta, _body = strip_front_matter(stamped_md)
+    model = _load_digest_model(json_path, meta.get("generated_at", ""))
+    if model is None:
+        return
+    model["status"] = {"reviewed": True, "reviewed_at": reviewed_at}
+    atomic_write_text(json_path, json.dumps(model, indent=2))
+    if html_enabled:
+        atomic_write_text(_stem_file(stem, "html"), render_dashboard_html(model))
 
 
 def _refresh_symlinks(dated_stem: Path, latest_stem: Path, formats: list[str]) -> None:

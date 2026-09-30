@@ -56,7 +56,6 @@ WINDOWED_KINDS = frozenset({"lp_bug_activity", "lp_mp_comment"})
 # A URL is rendered as a Markdown link only when it is http(s) and free of
 # characters that would break the [title](url) syntax or smuggle markup.
 _URL_UNSAFE = re.compile(r"[\s()<>\"'`]")
-_EPOCH = datetime.min.replace(tzinfo=UTC)
 
 
 def _safe_url(url: str) -> str | None:
@@ -321,56 +320,6 @@ def merge_into_state(
     return st
 
 
-def build_report(state: dict, now: datetime) -> dict:
-    """Split open items into New and Still open (today / week / older)."""
-    last_reviewed = state.get("last_reviewed")
-    new_items: list[dict] = []
-    still_open: list[dict] = []
-    for mid, r in sorted(state["items"].items()):
-        if r.get("status") != "open":
-            continue
-        first_seen = r.get("first_seen") or ""
-        fs = _parse(first_seen)
-        lr = _parse(last_reviewed) if last_reviewed else None
-        # An unparseable last_reviewed counts as never-reviewed (same as
-        # unset, matching first-run semantics): every open item is New.
-        # Conversely, an unparseable first_seen is treated as not-New — bad
-        # stored data must not promote an item into the New bucket.
-        is_new = lr is None or (fs is not None and fs > lr)
-        entry = {
-            "id": mid,
-            "repo": r.get("repo", ""),
-            "title": r.get("title", ""),
-            "url": r.get("url", ""),
-            "reasons": r.get("reasons", []),
-            "last_updated": r.get("last_updated", ""),
-            "reopen_count": r.get("reopen_count", 0),
-        }
-        (new_items if is_new else still_open).append(entry)
-
-    buckets: dict[str, list[dict]] = {b: [] for b in BUCKETS}
-    now_local = now.astimezone()
-    for entry in still_open:
-        lu = entry["last_updated"]
-        when = _parse(lu) if lu else None
-        when = when.astimezone() if when is not None else None
-        # unparseable last_updated buckets as "older" (defensive).
-        if when is not None and when.date() == now_local.date():
-            bucket = "today"
-        elif when is not None and when >= now_local - timedelta(days=7):
-            bucket = "week"
-        else:
-            bucket = "older"
-        buckets[bucket].append(entry)
-
-    def _sort_key(e: dict) -> datetime:
-        dt = _parse(e["last_updated"]) if e["last_updated"] else None
-        return dt if dt is not None else _EPOCH
-
-    new_items.sort(key=_sort_key, reverse=True)
-    return {"new": new_items, **buckets}
-
-
 def _recency_sort_key(ts: str | None) -> float:
     """Ascending sort key for a last_updated string: newest item first.
 
@@ -489,12 +438,12 @@ def report_model(
 
     New tier: every open item when `first_run`; otherwise first_seen after
     last_reviewed — an unparseable last_reviewed counts as never-reviewed
-    (all New) and an unparseable first_seen never promotes into New, the
-    same convention as build_report. Still-open items bucket by age. Empty
-    tiers, buckets and repo groups are omitted. With `activity_data`, the
-    `activity` section carries the nested provider model (activity_model)
-    plus the Markdown report (generate_report); without it, the placeholder
-    keeps the model shape stable.
+    (all New) and an unparseable first_seen never promotes into New. Still-
+    open items bucket by age. Empty tiers, buckets and repo groups are
+    omitted. With `activity_data`, the `activity` section carries the nested
+    provider model (activity_model) plus the Markdown report
+    (generate_report); without it, the placeholder keeps the model shape
+    stable.
     """
     end_dt = _parse(generated_at)
     # An unparseable generated_at is a programming error; degrade the report

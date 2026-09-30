@@ -4,7 +4,7 @@ from datetime import datetime
 
 import gitreport.attention as attention
 from gitreport.attention import (
-    build_report,
+    BADGE_BY_KIND,
     dedupe,
     merge_into_state,
     render_attention_body,
@@ -271,10 +271,9 @@ def test_retention_prune_is_not_part_of_the_merge():
     assert "gh:new" in st.items
 
 
-def test_build_report_new_vs_still_open_disjoint():
-    state = state_with(
-        last_reviewed="2026-09-27T06:00:00+00:00",
-        items={
+def test_report_model_new_vs_still_open_disjoint():
+    state = _model_state(
+        {
             "gh:1": rec(
                 title="New one",
                 first_seen="2026-09-28T06:00:00+00:00",
@@ -286,37 +285,60 @@ def test_build_report_new_vs_still_open_disjoint():
                 last_updated="2026-09-20T06:00:00+00:00",
             ),
         },
+        last_reviewed="2026-09-27T06:00:00+00:00",
     )
-    report = build_report(state, datetime.fromisoformat(NOW))
-    assert [e["id"] for e in report["new"]] == ["gh:1"]
-    still = [e["id"] for b in ("today", "week", "older") for e in report[b] if e["id"] == "gh:2"]
+    model = report_model(
+        state,
+        generated_at=NOW,
+        coverage_start="2026-09-27T06:00:00+00:00",
+        first_run=False,
+        stale_providers=[],
+    )
+    new_ids = [i["id"] for g in model["attention"]["new"]["groups"] for i in g["items"]]
+    assert new_ids == ["gh:1"]
+    still = [
+        i["id"] for b in model["attention"]["buckets"] for g in b["groups"] for i in g["items"]
+    ]
     assert still == ["gh:2"]
     # Disjoint: gh:1 never appears in a bucket.
-    assert not [e for b in ("today", "week", "older") for e in report[b] if e["id"] == "gh:1"]
+    assert "gh:1" not in still
 
 
-def test_build_report_bucketing():
+def test_report_model_age_buckets():
     # Fixed clock so the test cannot time-bomb around midnight or CI drift.
-    now = datetime.fromisoformat("2026-09-28T12:00:00+00:00")
-    state = state_with(
-        # After the items' first_seen (2026-09-20) so they count as still-open
-        # and exercise bucketing rather than the New bucket.
-        last_reviewed="2026-09-28T00:00:00+00:00",
-        items={
-            "gh:t": rec(first_seen="2026-09-20T00:00:00+00:00", last_updated=now.isoformat()),
+    state = _model_state(
+        {
+            "gh:t": rec(
+                first_seen="2026-09-20T00:00:00+00:00",
+                last_updated="2026-09-28T12:00:00+00:00",
+            ),
             "gh:w": rec(
-                first_seen="2026-09-20T00:00:00+00:00", last_updated="2026-09-25T00:00:00+00:00"
+                first_seen="2026-09-20T00:00:00+00:00",
+                last_updated="2026-09-25T00:00:00+00:00",
             ),
             "gh:o": rec(
-                first_seen="2026-09-20T00:00:00+00:00", last_updated="2026-08-01T00:00:00+00:00"
+                first_seen="2026-09-20T00:00:00+00:00",
+                last_updated="2026-08-01T00:00:00+00:00",
             ),
         },
+        # After the items' first_seen so they count as still-open and
+        # exercise bucketing rather than the New bucket.
+        last_reviewed="2026-09-28T00:00:00+00:00",
     )
-    report = build_report(state, now)
-    ids_today = [e["id"] for e in report["today"]]
-    assert "gh:t" in ids_today
-    assert [e["id"] for e in report["week"]] == ["gh:w"]
-    assert [e["id"] for e in report["older"]] == ["gh:o"]
+    model = report_model(
+        state,
+        generated_at="2026-09-28T12:00:00+00:00",
+        coverage_start="2026-09-28T00:00:00+00:00",
+        first_run=False,
+        stale_providers=[],
+    )
+    items_by_bucket = {
+        b["key"]: [i["id"] for g in b["groups"] for i in g["items"]]
+        for b in model["attention"]["buckets"]
+    }
+    assert "gh:t" in items_by_bucket["today"]
+    assert items_by_bucket["week"] == ["gh:w"]
+    assert items_by_bucket["older"] == ["gh:o"]
 
 
 # --- digest renderers (Task 4: model-based, categorized markdown) ------------
@@ -692,39 +714,65 @@ def test_merge_and_report_survive_garbage_last_updated():
     # survives the merge with its garbage last_updated intact.
     new_state = merge_into_state(state, {}, set(), NOW)
     assert "gh:bad" in new_state["items"]
-    report = build_report(new_state, datetime.fromisoformat(NOW))
-    # unparseable last_updated buckets as "older"; record survives
-    assert [e["id"] for e in report["older"]] == ["gh:bad"]
+    model = report_model(
+        AttentionState.model_validate(new_state),
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+    )
+    # unparseable last_updated buckets as "older" (and sorts last); record
+    # survives.
+    older = [b for b in model["attention"]["buckets"] if b["key"] == "older"]
+    assert [i["id"] for g in older[0]["groups"] for i in g["items"]] == ["gh:bad"]
     # R2-02: unparseable last_reviewed counts as never-reviewed (first-run
     # semantics) — the open item is New.
-    assert (
-        build_report({**new_state, "last_reviewed": "GARBAGE-TS"}, datetime.fromisoformat(NOW))[
-            "new"
-        ][0]["id"]
-        == "gh:bad"
+    model2 = report_model(
+        AttentionState.model_validate({**new_state, "last_reviewed": "GARBAGE-TS"}),
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
     )
+    new_ids = [i["id"] for g in model2["attention"]["new"]["groups"] for i in g["items"]]
+    assert new_ids == ["gh:bad"]
 
 
-def test_unparseable_first_seen_not_new():
-    state = state_with(
+def test_report_model_unparseable_first_seen_not_new():
+    state = _model_state(
+        {"gh:1": rec(first_seen="GARBAGE-TS")},
         last_reviewed="2026-09-27T06:00:00+00:00",
-        items={"gh:1": rec(first_seen="GARBAGE-TS")},
     )
-    report = build_report(state, datetime.fromisoformat(NOW))
-    assert not report["new"]
-    assert [e["id"] for e in report["older"] + report["week"] + report["today"]] == ["gh:1"]
+    model = report_model(
+        state,
+        generated_at=NOW,
+        coverage_start="2026-09-27T06:00:00+00:00",
+        first_run=False,
+        stale_providers=[],
+    )
+    assert "new" not in model["attention"]
+    still = [
+        i["id"] for b in model["attention"]["buckets"] for g in b["groups"] for i in g["items"]
+    ]
+    assert still == ["gh:1"]
 
 
-def test_new_bucket_sorted_newest_first():
-    state = state_with(
-        last_reviewed="2026-09-27T06:00:00+00:00",
-        items={
+def test_report_model_new_items_sorted_newest_first():
+    state = _model_state(
+        {
             "gh:early": rec(first_seen="2026-09-28T06:00:00+00:00", last_updated=NOW),
             "gh:late": rec(first_seen="2026-09-28T07:00:00+00:00", last_updated=LATER),
         },
     )
-    report = build_report(state, datetime.fromisoformat(NOW))
-    assert [e["id"] for e in report["new"]] == ["gh:late", "gh:early"]
+    model = report_model(
+        state,
+        generated_at=LATER,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+    )
+    new_ids = [i["id"] for g in model["attention"]["new"]["groups"] for i in g["items"]]
+    assert new_ids == ["gh:late", "gh:early"]
 
 
 def _entry(**overrides):
@@ -885,6 +933,15 @@ def test_humanize_age_edges():
 
 def _model_state(items, **extra):
     return AttentionState.model_validate(state_with(items=items, **extra))
+
+
+def test_badge_keys_match_kpi_filter_contract():
+    """Task 6 guard: the dashboard's KPI shortcuts (Assigned -> type=issue,
+    CI failing -> type=ci, Stale PRs -> type=stale) are wired to BADGE_BY_KIND
+    keys; a rename here would silently break those filters."""
+    assert BADGE_BY_KIND["ci_failure"] == ("CI", "ci")
+    assert BADGE_BY_KIND["issue_assigned"] == ("issue", "issue")
+    assert BADGE_BY_KIND["stale_pr"] == ("stale", "stale")
 
 
 def test_badges_for_precedence_and_lp_bug():
