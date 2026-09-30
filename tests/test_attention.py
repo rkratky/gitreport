@@ -616,3 +616,31 @@ def test_titles_not_re_escaped():
     out = render_attention_body(_report_with(entry), [])
     assert "Fix &amp; ship &lt;3" in out
     assert "&amp;amp;" not in out
+
+
+def test_humanize_age_units():
+    from gitreport.attention import humanize_age
+
+    now = datetime.fromisoformat(NOW)  # 2026-09-28T06:00:00+00:00
+    cases = {
+        "2026-09-28T05:00:00+00:00": "today",
+        "2026-09-27T10:00:00+00:00": "yesterday",
+        "2026-09-25T06:00:00+00:00": "3 days ago",
+        "2026-09-14T06:00:00+00:00": "2 weeks ago",
+        "2026-08-01T06:00:00+00:00": "1 month ago",
+        "2026-05-01T06:00:00+00:00": "4 months ago",
+        "2025-06-01T06:00:00+00:00": "1 year, 3 months ago",
+    }
+    for ts, expected in cases.items():
+        assert humanize_age(ts, now) == expected, ts
+
+
+def test_humanize_age_edges():
+    from gitreport.attention import humanize_age
+
+    now = datetime.fromisoformat(NOW)
+    assert humanize_age(None, now) == "unknown age"
+    assert humanize_age("garbage", now) == "unknown age"
+    assert humanize_age("2026-09-29T06:00:00+00:00", now) == "just now"  # future
+    # 1 year exactly -> no zero remainder
+    assert humanize_age("2025-09-28T06:00:00+00:00", now) == "1 year ago"

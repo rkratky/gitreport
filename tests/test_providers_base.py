@@ -1,4 +1,4 @@
-from gitreport.providers.base import AttentionItem, escape_user, is_excluded
+from gitreport.providers.base import AttentionItem, escape_user, is_excluded, unescape_user
 
 
 def test_escape_user_neutralises_html_and_markdown():
@@ -59,3 +59,18 @@ def test_is_excluded_globs():
     assert is_excluded("me/dotfiles", ["me/*"])
     assert not is_excluded("org/repo", ["me/*"])
     assert not is_excluded("org/repo", None)
+
+
+def test_unescape_user_reverses_escape_user():
+    from gitreport.providers.base import escape_user
+
+    for raw in ["Fix login crash", "Bug & <b>bold</b> [x](y) *em_", "a\\b", "C:\\path"]:
+        assert unescape_user(escape_user(raw)).replace("\\", "") == raw.replace("\\", "")
+
+
+def test_unescape_user_strips_backslash_before_specials():
+    assert unescape_user("fix\\_login \\- ok") == "fix_login - ok"
+
+
+def test_unescape_user_plain_unchanged():
+    assert unescape_user("plain text") == "plain text"

@@ -18,8 +18,43 @@ WINDOWED_KINDS = frozenset({"lp_bug_activity", "lp_mp_comment"})
 
 # A URL is rendered as a Markdown link only when it is http(s) and free of
 # characters that would break the [title](url) syntax or smuggle markup.
-_URL_UNSAFE = re.compile(r"[\s()<>]")
+_URL_UNSAFE = re.compile(r"[\s()<>\"'`]")
 _EPOCH = datetime.min.replace(tzinfo=UTC)
+
+
+def humanize_age(ts: str | None, now: datetime) -> str:
+    """Humanized age as of `now`: today/yesterday (local calendar dates),
+    then largest single unit below one year (day/week/month), then
+    years + remainder months. Unknown/future handled per spec."""
+    dt = _parse(ts)
+    if dt is None:
+        return "unknown age"
+    if dt > now:
+        return "just now"
+    local_dt, local_now = dt.astimezone(), now.astimezone()
+    day_delta = (local_now.date() - local_dt.date()).days
+    if day_delta <= 0:
+        return "today"
+    if day_delta == 1:
+        return "yesterday"
+    days = (local_now - local_dt).total_seconds() / 86400
+    if days < 14:
+        n = int(days)
+        unit = "day"
+    elif days < 21:
+        n = int(days // 7)
+        unit = "week"
+    elif days < 365:
+        n = int(days // 30.44)
+        unit = "month"
+    else:
+        years = int(days // 365)
+        months = int((days - years * 365) // 30.44)
+        y = f"{years} year{'' if years == 1 else 's'}"
+        if months == 0:
+            return f"{y} ago"
+        return f"{y}, {months} month{'' if months == 1 else 's'} ago"
+    return f"{n} {unit}{'' if n == 1 else 's'} ago"
 
 
 def _parse(ts: str | None) -> datetime | None:

@@ -146,6 +146,26 @@ def escape_user(text: str) -> str:
     return text
 
 
+def unescape_user(text: str) -> str:
+    """Approximate inverse of escape_user, for plain-display text.
+
+    Removes a backslash immediately preceding a Markdown-metacharacter (one
+    left-to-right pass), then resolves HTML entities. The whitespace
+    collapse escape_user performs is not reversible (cosmetic only).
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in _MD_SPECIALS:
+            i += 1
+            out.append(text[i])
+        else:
+            out.append(ch)
+        i += 1
+    return _html.unescape("".join(out))
+
+
 def is_excluded(repo: str, patterns: list[str] | None) -> bool:
     """True when `repo` matches any exclusion glob."""
     return any(fnmatch(repo, pattern) for pattern in (patterns or []))
