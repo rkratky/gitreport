@@ -10,6 +10,7 @@ from gitreport.attention import (
     render_attention_stdout,
     render_digest_markdown,
 )
+from gitreport.providers.base import empty_repo_activity
 from gitreport.state import AttentionState, prune
 
 NOW = "2026-09-28T06:00:00+00:00"
@@ -702,25 +703,73 @@ def _model_state(items, **extra):
 def test_badges_for_precedence_and_lp_bug():
     from gitreport.attention import badges_for
 
+    # Badges are [label, key] LISTS, not tuples: the model is serialised to
+    # JSON (tuples become lists) and renderers/reload compare by value.
     # Precedence regardless of input order (state stores kinds sorted).
-    assert badges_for(["stale_pr", "ci_failure"], "github") == [("CI", "ci"), ("stale", "stale")]
+    assert badges_for(["stale_pr", "ci_failure"], "github") == [["CI", "ci"], ["stale", "stale"]]
     assert badges_for(["comment", "mention", "thread_unresolved"], None) == [
-        ("thread", "thread"),
-        ("mention", "mention"),
-        ("comment", "comment"),
+        ["thread", "thread"],
+        ["mention", "mention"],
+        ["comment", "comment"],
     ]
-    # Unknown kind -> ("item", "item"), ordered after all known badges.
+    # Unknown kind -> ["item", "item"], ordered after all known badges.
     assert badges_for(["ci_failure", "mystery_kind"], "github") == [
-        ("CI", "ci"),
-        ("item", "item"),
+        ["CI", "ci"],
+        ["item", "item"],
     ]
-    assert badges_for(["mystery_kind"], "github") == [("item", "item")]
+    assert badges_for(["mystery_kind"], "github") == [["item", "item"]]
     # Launchpad override: issue_assigned renders the bug badge.
-    assert badges_for(["issue_assigned"], "launchpad") == [("bug", "bug")]
-    assert badges_for(["issue_assigned"], "github") == [("issue", "issue")]
-    # Duplicate kinds dedupe to one badge; no kinds -> no badges.
-    assert badges_for(["mention", "mention"], "github") == [("mention", "mention")]
-    assert badges_for([], "github") == []
+    assert badges_for(["issue_assigned"], "launchpad") == [["bug", "bug"]]
+    assert badges_for(["issue_assigned"], "github") == [["issue", "issue"]]
+    # Duplicate kinds dedupe to one badge.
+    assert badges_for(["mention", "mention"], "github") == [["mention", "mention"]]
+    # Empty kinds still get the muted item badge so filters can select them.
+    assert badges_for([], "github") == [["item", "item"]]
+
+
+def test_type_badges_json_round_trip_stable():
+    """The model's type_badges must survive a JSON round-trip unchanged —
+    renderers and reloaded models compare by value, and JSON turns tuples
+    into lists, so the model carries lists from the start."""
+    import json
+
+    from gitreport.attention import report_model
+
+    model = report_model(
+        _model_state({"gh:1": rec(kinds=["ci_failure", "mention"])}),
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+    )
+    reloaded = json.loads(json.dumps(model))
+    assert reloaded["attention"]["new"]["groups"][0]["items"][0]["type_badges"] == [
+        ["CI", "ci"],
+        ["mention", "mention"],
+    ]
+
+
+def test_item_entry_provider_fallback_from_mid_prefix():
+    """Legacy state items predate the provider field: the lp: id prefix still
+    routes issue_assigned to the Launchpad bug badge; a non-LP item without a
+    provider keeps the plain issue badge."""
+    from gitreport.attention import report_model
+
+    model = report_model(
+        _model_state(
+            {
+                "lp:1": rec(provider=None, kinds=["issue_assigned"], repo="proj"),
+                "gh:9": rec(provider=None, kinds=["issue_assigned"], repo="o/r"),
+            }
+        ),
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+    )
+    entries = {i["id"]: i for g in model["attention"]["new"]["groups"] for i in g["items"]}
+    assert entries["lp:1"]["type_badges"] == [["bug", "bug"]]
+    assert entries["gh:9"]["type_badges"] == [["issue", "issue"]]
 
 
 def test_age_bucket_first_match(monkeypatch):
@@ -747,6 +796,23 @@ def test_age_bucket_first_match(monkeypatch):
     # Unparseable / None -> "older" (defensive; sorted last).
     assert age_bucket(None, now) == "older"
     assert age_bucket("GARBAGE-TS", now) == "older"
+
+
+def test_age_bucket_naive_now_treated_as_utc(monkeypatch):
+    """Same naive-`now` guard as humanize_age: a naive `now` is normalised to
+    UTC, never interpreted as local time. Pinned to UTC-7 so the two
+    interpretations land on different local calendar dates (time.tzset() is
+    POSIX-only; see the humanize_age tests)."""
+    from gitreport.attention import age_bucket
+
+    monkeypatch.setenv("TZ", "Etc/GMT+7")  # POSIX/tzdata name: UTC-7
+    time.tzset()
+    now = datetime.fromisoformat("2026-09-28T06:00:00")  # naive
+    # 20:00Z on the 27th is 13:00 local on the 27th; the guard maps the naive
+    # `now` to 06:00Z = 23:00 local on the 27th — same local date -> today.
+    # Without the guard, `now` would read as 06:00 local on the 28th -> week.
+    assert age_bucket("2026-09-27T20:00:00+00:00", now) == "today"
+    assert age_bucket(None, now) == "older"  # unparseable still buckets last
 
 
 def test_report_model_groups_and_buckets():
@@ -820,7 +886,7 @@ def test_report_model_groups_and_buckets():
     gh1 = new_groups[0]["items"][0]
     assert gh1["id"] == "gh:1"
     assert gh1["age_bucket"] == "new"
-    assert gh1["type_badges"] == [("CI", "ci"), ("stale", "stale")]
+    assert gh1["type_badges"] == [["CI", "ci"], ["stale", "stale"]]
     assert set(gh1) == {
         "id",
         "repo",
@@ -839,11 +905,11 @@ def test_report_model_groups_and_buckets():
     assert gh1["reasons"] == ["3 unresolved comments"]
     assert gh1["reopened"] is False
     gh2 = buckets["month"]["groups"][0]["items"][0]
-    assert gh2["type_badges"] == [("issue", "issue")]
+    assert gh2["type_badges"] == [["issue", "issue"]]
     assert gh2["age"] == "3 weeks ago"
     assert gh2["age_bucket"] == "month"
     lp1 = buckets["older"]["groups"][0]["items"][0]
-    assert lp1["type_badges"] == [("bug", "bug")]  # LP provider override
+    assert lp1["type_badges"] == [["bug", "bug"]]  # LP provider override
     assert lp1["age"] == "1 month ago"
     assert lp1["age_bucket"] == "older"
     # No activity data yet (Task 3): placeholder.
@@ -1022,3 +1088,110 @@ def test_report_model_url_guarded_and_reopened_flag():
     assert items["gh:1"]["reopened"] is True
     assert items["gh:2"]["url"] == ""  # parens break [title](url): no link
     assert items["gh:3"]["url"] == "https://example.com/1"
+
+
+# --- activity model (Task 3: nested providers/groups/categories) --------------
+
+
+def test_activity_model_nested():
+    from gitreport.attention import activity_model
+
+    empty = empty_repo_activity("public")
+    empty["prs_submitted"].append({"title": "T", "url": "https://x/1"})
+    other = empty_repo_activity("private")
+    data = {"github": {"o/r": empty, "a/b": other}}
+    model = activity_model(data)
+    prov = model["providers"][0]
+    assert prov["provider"] == "github" and prov["label"] == "GitHub"
+    repos = [g["repo"] for g in prov["groups"]]
+    assert repos == ["a/b", "o/r"]  # alphabetical
+    o_r = next(g for g in prov["groups"] if g["repo"] == "o/r")
+    assert o_r["visibility"] == "public"
+    cats = {c["key"]: c for c in o_r["categories"]}
+    assert cats["prs_submitted"]["label"] == "PRs submitted"
+    assert cats["prs_submitted"]["items"] == [
+        {"title": "T", "url": "https://x/1", "also_merged": False}
+    ]
+
+
+def test_activity_model_omits_empty_categories():
+    """Categories with no items are omitted; every repo still gets a group
+    even when all of its categories are empty (a/b in the nested test)."""
+    from gitreport.attention import activity_model
+
+    repo = empty_repo_activity("public")
+    repo["prs_merged"].append({"title": "M", "url": "https://x/2", "also_merged": True})
+    model = activity_model({"github": {"o/r": repo}})
+    groups = model["providers"][0]["groups"]
+    assert [g["repo"] for g in groups] == ["o/r"]
+    cats = groups[0]["categories"]
+    assert [c["key"] for c in cats] == ["prs_merged"]
+    assert cats[0]["items"] == [{"title": "M", "url": "https://x/2", "also_merged": True}]
+
+
+def test_activity_model_category_order_and_raw_titles():
+    """Categories appear in ACTIVITY_CATEGORIES order regardless of insertion
+    order; labels come from the provider taxonomy; titles stay RAW (escaping
+    happens at render time only)."""
+    from gitreport.attention import activity_model
+
+    repo = empty_repo_activity("public")
+    repo["issues_closed"].append({"title": "Fix & ship", "url": "https://x/3"})
+    repo["prs_submitted"].append({"title": "P", "url": "https://x/4"})
+    model = activity_model({"launchpad": {"p": repo}})
+    prov = model["providers"][0]
+    assert prov["label"] == "Launchpad"
+    cats = prov["groups"][0]["categories"]
+    assert [c["key"] for c in cats] == ["prs_submitted", "issues_closed"]
+    assert cats[0]["label"] == "Merge proposals submitted"  # Launchpad taxonomy
+    # Raw title: no unescape_user/escape_user round-trip on the model.
+    assert cats[1]["items"][0]["title"] == "Fix & ship"
+
+
+def test_activity_model_unknown_provider_fallbacks():
+    """Unknown providers fall back to .title() display names and title-cased
+    category labels, mirroring generate_report's fallbacks."""
+    from gitreport.attention import activity_model
+
+    repo = empty_repo_activity("public")
+    repo["prs_submitted"].append({"title": "P", "url": "https://x/5"})
+    model = activity_model({"gitlab": {"g/r": repo}})
+    prov = model["providers"][0]
+    assert prov["provider"] == "gitlab"
+    assert prov["label"] == "Gitlab"
+    cat = prov["groups"][0]["categories"][0]
+    assert cat["label"] == "Prs Submitted"
+
+
+def test_activity_model_provider_insertion_order():
+    """Providers keep insertion order (only repos are alphabetised)."""
+    from gitreport.attention import activity_model
+
+    data = {
+        "launchpad": {"p": empty_repo_activity("public")},
+        "github": {"o/r": empty_repo_activity("public")},
+    }
+    model = activity_model(data)
+    assert [p["provider"] for p in model["providers"]] == ["launchpad", "github"]
+
+
+def test_report_model_activity_wiring():
+    """With activity_data, report_model fills providers from activity_model
+    and markdown from generate_report; without it, the placeholder stays."""
+    from gitreport.attention import activity_model, report_model
+
+    empty = empty_repo_activity("public")
+    empty["prs_submitted"].append({"title": "T", "url": "https://x/1"})
+    data = {"github": {"o/r": empty}}
+    model = report_model(
+        _model_state({}),
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+        activity_data=data,
+    )
+    assert model["activity"]["providers"] == activity_model(data)["providers"]
+    md = model["activity"]["markdown"]
+    assert "# Git activity report" in md
+    assert "- [T](https://x/1)" in md

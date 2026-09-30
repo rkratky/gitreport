@@ -5,6 +5,7 @@ import re
 from datetime import UTC, datetime, timedelta
 
 from .providers.base import unescape_user
+from .reporting import ACTIVITY_CATEGORIES, PROVIDER_DISPLAY_NAMES, PROVIDER_LABELS
 from .state import AttentionState, ItemState
 
 MAX_REASONS = 10
@@ -65,20 +66,25 @@ def _safe_url(url: str) -> str | None:
     return None
 
 
-def badges_for(kinds: list[str], provider: str | None) -> list[tuple[str, str]]:
+def badges_for(kinds: list[str], provider: str | None) -> list[list[str]]:
     """Distinct type badges in precedence order for an item's kinds.
 
     issue_assigned renders the bug badge under the Launchpad provider
-    taxonomy; unknown kinds fall back to the muted item badge, ordered last.
+    taxonomy; unknown kinds fall back to the muted item badge, ordered last;
+    empty kinds still get it so filters can select the items. Badges are
+    [label, key] LISTS, not tuples: the report model is serialised to JSON
+    (which turns tuples into lists) and renderers/reload compare by value.
     """
-    out: list[tuple[str, str]] = []
+    out: list[list[str]] = []
     for kind in kinds or []:
         if kind == "issue_assigned" and provider == "launchpad":
-            badge = ("bug", "bug")
+            badge = ["bug", "bug"]
         else:
-            badge = BADGE_BY_KIND.get(kind, ("item", "item"))
+            badge = list(BADGE_BY_KIND.get(kind, ("item", "item")))
         if badge not in out:
             out.append(badge)
+    if not out:
+        out.append(["item", "item"])
     out.sort(key=lambda b: BADGE_PRECEDENCE.index(b[1]))
     return out
 
@@ -142,7 +148,10 @@ def age_bucket(last_updated: str | None, now: datetime) -> str:
     """Bucket for a still-open item's last_updated, evaluated in order, first
     match wins, all boundaries inclusive: today = same local calendar date as
     `now`; week = >= now - 7d; month = >= now - 30d; else older. Unparseable
-    input buckets as older (defensive; sorted last)."""
+    input buckets as older (defensive; sorted last). A naive `now` is treated
+    as UTC, the same convention as humanize_age."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)  # naive `now` is treated as UTC
     dt = _parse(last_updated)
     if dt is None:
         return "older"
@@ -378,6 +387,9 @@ def _item_entry(mid: str, r: ItemState, now: datetime, bucket: str) -> dict:
     time). url is scheme-guarded here — an unsafe URL degrades to "" so no
     renderer can link it by accident.
     """
+    # Legacy state items predate the provider field: fall back to the id
+    # prefix so Launchpad records still get the bug badge override.
+    provider = r.provider or ("launchpad" if mid.startswith("lp:") else None)
     return {
         "id": mid,
         "repo": r.repo or "",
@@ -385,7 +397,7 @@ def _item_entry(mid: str, r: ItemState, now: datetime, bucket: str) -> dict:
         "url": _safe_url(r.url or "") or "",
         "reasons": [unescape_user(reason) for reason in r.reasons],
         "kinds": list(r.kinds),
-        "type_badges": badges_for(list(r.kinds), r.provider),
+        "type_badges": badges_for(list(r.kinds), provider),
         "age": humanize_age(r.last_updated, now),
         "age_bucket": bucket,
         "last_updated": r.last_updated or "",
@@ -411,6 +423,54 @@ def _repo_groups(items: list[dict]) -> list[dict]:
     ]
 
 
+def activity_model(activity_data: dict) -> dict:
+    """Nested activity model: providers in insertion order, repos
+    alphabetical, categories non-empty only and in ACTIVITY_CATEGORIES
+    order. Provider labels come from PROVIDER_DISPLAY_NAMES (.title()
+    fallback), category labels from the provider's PROVIDER_LABELS
+    (title-cased key fallback) — mirroring generate_report. Titles are
+    carried RAW: escaping happens only at render time, and also_merged is
+    normalised to a plain bool so the JSON round-trip is stable.
+    """
+    providers: list[dict] = []
+    for provider, repos in activity_data.items():
+        key = provider.lower()
+        labels = PROVIDER_LABELS.get(key, {})
+        groups: list[dict] = []
+        for repo in sorted(repos):
+            activity = repos[repo]
+            categories: list[dict] = []
+            for category in ACTIVITY_CATEGORIES:
+                items = activity[category]
+                if not items:
+                    continue  # empty categories are omitted
+                categories.append(
+                    {
+                        "key": category,
+                        "label": labels.get(category, category.replace("_", " ").title()),
+                        "items": [
+                            {
+                                "title": item.get("title", ""),
+                                "url": item.get("url", ""),
+                                "also_merged": bool(item.get("also_merged", False)),
+                            }
+                            for item in items
+                        ],
+                    }
+                )
+            groups.append(
+                {"repo": repo, "visibility": activity["visibility"], "categories": categories}
+            )
+        providers.append(
+            {
+                "provider": provider,
+                "label": PROVIDER_DISPLAY_NAMES.get(key, provider.title()),
+                "groups": groups,
+            }
+        )
+    return {"providers": providers}
+
+
 def report_model(
     state: AttentionState,
     *,
@@ -426,9 +486,10 @@ def report_model(
     last_reviewed — an unparseable last_reviewed counts as never-reviewed
     (all New) and an unparseable first_seen never promotes into New, the
     same convention as build_report. Still-open items bucket by age. Empty
-    tiers, buckets and repo groups are omitted. `activity` is filled from
-    `activity_data` (the activity model lands in a later task); a placeholder
-    keeps the model shape stable until then.
+    tiers, buckets and repo groups are omitted. With `activity_data`, the
+    `activity` section carries the nested provider model (activity_model)
+    plus the Markdown report (generate_report); without it, the placeholder
+    keeps the model shape stable.
     """
     end_dt = _parse(generated_at)
     # An unparseable generated_at is a programming error; degrade the report
@@ -482,6 +543,17 @@ def report_model(
         "stale_prs": sum(1 for e in open_entries if "stale_pr" in e["kinds"]),
     }
 
+    if activity_data is not None:
+        # Lazy import: keeps .reporting out of the module import graph.
+        from .reporting import generate_report
+
+        activity = {
+            "markdown": generate_report(activity_data),
+            "providers": activity_model(activity_data)["providers"],
+        }
+    else:
+        activity = {"markdown": "", "providers": []}
+
     return {
         "schema_version": 1,
         "generated_at": generated_at,
@@ -495,9 +567,7 @@ def report_model(
         "stale_providers": list(stale_providers),
         "kpi": kpi,
         "attention": attention,
-        "activity": (
-            activity_data if activity_data is not None else {"markdown": "", "providers": []}
-        ),
+        "activity": activity,
     }
 
 
