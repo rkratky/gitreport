@@ -641,3 +641,16 @@ def test_dashboard_kpi_click_contract(utc_tz):
     assert ".gr-kpi" in script
     for val in ("new", "today", "week", "month", "older", "issue", "ci", "stale"):
         assert f'"{val}"' in script
+
+
+def test_dashboard_kpi_count_contract(utc_tz):
+    # Spec §Interactivity: KPI counts reflect the filtered view. The script
+    # recomputes each card's value on every filter pass from the rows that
+    # stay visible, writing into the count element inside the card; with no
+    # filters active the recomputed counts equal the rendered ones.
+    page = render_dashboard_html(_dash_model(_dash_items()))
+    script = _dash_script(page)
+    assert "function updateKpiCounts" in script
+    assert "updateKpiCounts();" in script  # invoked from the shared routine
+    assert 'querySelector(".gr-kpi-value")' in script
+    assert "!row.hidden" in script  # only visible rows are counted

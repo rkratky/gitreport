@@ -432,6 +432,7 @@ _DASH_JS = r"""(function () {
   var rows = [];
   var groups = [];
   var sections = [];
+  var kpis = [];
   var generatedAt = "";
   var memStore = {};
 
@@ -500,9 +501,28 @@ _DASH_JS = r"""(function () {
     return values;
   }
 
+  // Row matches one chip dimension: OR within the dimension's selected
+  // values, an empty selection matching every row. Shared by the row filter
+  // and the KPI counters; "type" is the space-joined badge key list, age and
+  // repo are single attribute values.
+  function matchesDimension(row, dimension, values) {
+    if (Object.keys(values).length === 0) {
+      return true;
+    }
+    if (dimension === "type") {
+      return (row.getAttribute("data-type") || "")
+        .split(/\s+/)
+        .some(function (key) {
+          return key !== "" && values[key];
+        });
+    }
+    return !!values[row.getAttribute("data-" + dimension) || ""];
+  }
+
   // A row stays visible iff the search and every chip dimension match; an
   // empty search or dimension selection always matches. Empty groups and
-  // sections are hidden live and the "N of M" count is refreshed.
+  // sections are hidden live, the "N of M" count is refreshed and each KPI
+  // card is updated to the number of visible rows matching its own filter.
   function applyFilters() {
     var query = search && search.value ? search.value.trim().toLowerCase() : "";
     var typeSel = pressedValues("type");
@@ -511,23 +531,11 @@ _DASH_JS = r"""(function () {
     var visible = 0;
     rows.forEach(function (row) {
       var text = (row.getAttribute("data-text") || "").toLowerCase();
-      var ok = true;
-      if (query && text.indexOf(query) === -1) {
-        ok = false;
-      }
-      if (ok && Object.keys(typeSel).length) {
-        ok = (row.getAttribute("data-type") || "")
-          .split(/\s+/)
-          .some(function (key) {
-            return key !== "" && typeSel[key];
-          });
-      }
-      if (ok && Object.keys(ageSel).length) {
-        ok = !!ageSel[row.getAttribute("data-age") || ""];
-      }
-      if (ok && Object.keys(repoSel).length) {
-        ok = !!repoSel[row.getAttribute("data-repo") || ""];
-      }
+      var ok =
+        (!query || text.indexOf(query) !== -1) &&
+        matchesDimension(row, "type", typeSel) &&
+        matchesDimension(row, "age", ageSel) &&
+        matchesDimension(row, "repo", repoSel);
       row.hidden = !ok;
       if (ok) {
         visible += 1;
@@ -546,10 +554,15 @@ _DASH_JS = r"""(function () {
     if (countEl) {
       countEl.textContent = visible + " of " + rows.length + " items";
     }
+    updateKpiCounts();
   }
 
   // KPI cards double as filter shortcuts (spec mapping): each toggles its
   // chip set as a group — all on when not all were on, all off otherwise.
+  // The same mapping is the single source of truth for the live counts:
+  // each card shows the number of visible rows matching its own filter
+  // (OR within a dimension, AND across dimensions — the chip rule). With no
+  // filters active the recomputed counts equal the rendered ones.
   var KPI_FILTERS = {
     new: [["age", "new"]],
     still_open: [["age", "today"], ["age", "week"], ["age", "month"], ["age", "older"]],
@@ -572,41 +585,66 @@ _DASH_JS = r"""(function () {
     return found;
   }
 
-  function wireKpiCards() {
-    [].slice.call(document.querySelectorAll(".gr-kpi[data-kpi]")).forEach(
-      function (card) {
-        // Clickability is a script enhancement: without JS the cards stay
-        // plain, non-interactive divs.
-        card.setAttribute("role", "button");
-        card.setAttribute("tabindex", "0");
-        var activate = function () {
-          var mapped = (KPI_FILTERS[card.getAttribute("data-kpi")] || [])
-            .map(function (spec) {
-              return findChip(spec[0], spec[1]);
-            })
-            .filter(function (chip) {
-              return chip !== null;
-            });
-          if (mapped.length === 0) {
-            return;
-          }
-          var allOn = mapped.every(function (chip) {
-            return chip.getAttribute("aria-pressed") === "true";
-          });
-          mapped.forEach(function (chip) {
-            chip.setAttribute("aria-pressed", allOn ? "false" : "true");
-          });
-          applyFilters();
-        };
-        card.addEventListener("click", activate);
-        card.addEventListener("keydown", function (event) {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            activate();
-          }
-        });
+  function updateKpiCounts() {
+    kpis.forEach(function (card) {
+      var byDim = {};
+      (KPI_FILTERS[card.getAttribute("data-kpi")] || []).forEach(
+        function (spec) {
+          (byDim[spec[0]] = byDim[spec[0]] || {})[spec[1]] = true;
+        }
+      );
+      var dims = Object.keys(byDim);
+      var value = 0;
+      rows.forEach(function (row) {
+        if (
+          !row.hidden &&
+          dims.every(function (dim) {
+            return matchesDimension(row, dim, byDim[dim]);
+          })
+        ) {
+          value += 1;
+        }
+      });
+      var valueEl = card.querySelector(".gr-kpi-value");
+      if (valueEl) {
+        valueEl.textContent = String(value);
       }
-    );
+    });
+  }
+
+  function wireKpiCards() {
+    kpis.forEach(function (card) {
+      // Clickability is a script enhancement: without JS the cards stay
+      // plain, non-interactive divs.
+      card.setAttribute("role", "button");
+      card.setAttribute("tabindex", "0");
+      var activate = function () {
+        var mapped = (KPI_FILTERS[card.getAttribute("data-kpi")] || [])
+          .map(function (spec) {
+            return findChip(spec[0], spec[1]);
+          })
+          .filter(function (chip) {
+            return chip !== null;
+          });
+        if (mapped.length === 0) {
+          return;
+        }
+        var allOn = mapped.every(function (chip) {
+          return chip.getAttribute("aria-pressed") === "true";
+        });
+        mapped.forEach(function (chip) {
+          chip.setAttribute("aria-pressed", allOn ? "false" : "true");
+        });
+        applyFilters();
+      };
+      card.addEventListener("click", activate);
+      card.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          activate();
+        }
+      });
+    });
   }
 
   function init() {
@@ -616,6 +654,7 @@ _DASH_JS = r"""(function () {
     rows = [].slice.call(document.querySelectorAll(".gr-item"));
     groups = [].slice.call(document.querySelectorAll("details.gr-repo"));
     sections = [].slice.call(document.querySelectorAll(".gr-section"));
+    kpis = [].slice.call(document.querySelectorAll(".gr-kpi[data-kpi]"));
     generatedAt = document.body.getAttribute("data-generated-at") || "";
     if (search) {
       search.addEventListener("input", applyFilters);
