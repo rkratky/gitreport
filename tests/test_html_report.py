@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 
@@ -479,3 +480,91 @@ def test_atomic_write_text_replaces_existing(tmp_path):
     atomic_write_text(target, "new")
     assert target.read_text(encoding="utf-8") == "new"
     assert [p.name for p in tmp_path.iterdir()] == ["out.html"]
+
+
+# --- fix round 1 (review findings) -------------------------------------------
+
+
+def test_dashboard_omits_empty_new_section(utc_tz):
+    # BUG-01: empty tiers are omitted — a model with only bucket items shows
+    # no "New since last review" heading, the bucket tier still renders.
+    items = {
+        "gh:2": _dash_rec(
+            repo="o/r2",
+            url="https://github.com/o/r2/pull/2",
+            first_seen="2026-09-01T06:00:00+00:00",
+            last_updated="2026-09-01T06:00:00+00:00",
+        ),
+    }
+    html = render_dashboard_html(_dash_model(items))
+    assert "<h2>New since last review</h2>" not in html
+    assert "<h2>Last 30 days</h2>" in html
+
+
+def test_dashboard_summary_selects_on_kinds(utc_tz):
+    # BUG-02: CI/stale summaries select on entry kinds ("ci_failure"/
+    # "stale_pr" per spec), not on badge keys — a type key that differs from
+    # the kind still lands in the summary.
+    model = _dash_model(_dash_items())
+    model["attention"]["new"]["groups"][0]["items"][0]["type_badges"] = [["item", "item"]]
+    html = render_dashboard_html(model)
+    # Row + CI-failures summary + stale-PRs summary.
+    assert html.count('href="https://github.com/o/r/pull/1"') == 3
+
+
+def test_dashboard_chips_fixed_labels_mp(utc_tz):
+    # BUG-03: chips carry a fixed label per key — "lp_mp_comment" and
+    # "lp_mp_needs_review" both badge as key "mp", so per-badge labels would
+    # collapse (here to "MP review", first-seen) ; the chip row shows exactly
+    # one "MP" chip regardless of kind order. The MP-review outline-variant
+    # styling is deferred. Item badges keep their labels.
+    items = {
+        "lp:1": _dash_rec(
+            provider="launchpad",
+            kinds=["lp_mp_needs_review", "lp_mp_comment"],
+            repo="lp:ubuntu",
+            title="MP both",
+            url="https://code.launchpad.net/~x/y/+merge/1",
+            first_seen=DASH_NOW,
+            last_updated=DASH_NOW,
+        ),
+    }
+    html = render_dashboard_html(_dash_model(items))
+    assert html.count('data-dim="type" data-val="mp"') == 1
+    assert '<button type="button" class="gr-chip" data-dim="type" data-val="mp">MP</button>' in html
+    assert '<span class="gr-badge gr-badge--mp">MP</span>' in html
+    assert '<span class="gr-badge gr-badge--mp">MP review</span>' in html
+
+
+def test_atomic_write_text_umask_mode(tmp_path):
+    # BUG-04: the target's mode is 0o666 & ~umask — world-readable under
+    # umask 022 (mkstemp's private 0600 must not leak into the report).
+    old = os.umask(0o022)
+    try:
+        target = tmp_path / "out.html"
+        atomic_write_text(target, "hi")
+        assert (target.stat().st_mode & 0o777) == 0o644
+    finally:
+        os.umask(old)
+
+
+def test_dashboard_activity_skips_empty_categories(utc_tz):
+    # BUG-05: a category with no items renders no label, and a group renders
+    # only when at least one of its categories has items.
+    repo = empty_repo_activity("public")
+    repo["prs_merged"].append({"title": "M", "url": "https://x/2"})
+    model = _dash_model({}, activity={"github": {"o/r": repo}})
+    cats = model["activity"]["providers"][0]["groups"][0]["categories"]
+    cats.append({"key": "prs_reviewed", "label": "PRs reviewed", "items": []})
+    model["activity"]["providers"][0]["groups"].append(
+        {
+            "repo": "o/empty",
+            "visibility": "public",
+            "categories": [{"key": "prs_submitted", "label": "PRs submitted", "items": []}],
+        }
+    )
+    html = render_dashboard_html(model)
+    assert "PRs reviewed" not in html
+    assert "o/empty" not in html
+    assert "PRs submitted" not in html
+    assert 'href="https://x/2">M</a>' in html

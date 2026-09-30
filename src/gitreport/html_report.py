@@ -407,14 +407,21 @@ def escape_html(s) -> str:
 
 def atomic_write_text(path: Path, text: str) -> Path:
     """Write `text` to `path` atomically: parent dirs are created, the text
-    lands in a sibling temp file that then os.replace()s the target, so a
-    reader never observes a half-written artifact."""
+    lands in a sibling temp file that is flushed, fsynced and chmodded to
+    0o666 & ~umask (mkstemp's private 0600 must not leak into the report)
+    before os.replace()ing the target, so a reader never observes a
+    half-written artifact."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp_name, 0o666 & ~umask)
         os.replace(tmp_name, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -545,9 +552,29 @@ def _render_section(heading: str, groups: list[dict], bucket: str) -> str:
     return f'<section class="gr-section"><h2>{escape_html(heading)}</h2>{body}</section>'
 
 
+# Fixed chip labels per type key (BUG-03): two kinds can share a badge key
+# ("lp_mp_comment"/"lp_mp_needs_review" both → "mp"), so first-seen badge
+# labels would collapse into whichever item came first. Chips show one fixed
+# label per key; item-row badges keep their kind-specific labels. Deferred:
+# an outline-variant chip/badge styling for MP review.
+_CHIP_LABELS = {
+    "ci": "CI",
+    "pr": "PR review",
+    "thread": "thread",
+    "issue": "issue",
+    "bug": "bug",
+    "mp": "MP",
+    "mention": "mention",
+    "comment": "comment",
+    "stale": "stale",
+    "item": "item",
+}
+
+
 def _render_chips(model: dict) -> str:
-    """Filter chips (decorative until Task 6): one per type key present, the
-    fixed age set, one per repo group — deduped in model order."""
+    """Filter chips (decorative until Task 6): one per type key present with
+    its fixed label, the fixed age set, one per repo group — deduped in
+    model order."""
     type_chips: list[str] = []
     seen_types: set[str] = set()
     repo_chips: list[str] = []
@@ -558,7 +585,8 @@ def _render_chips(model: dict) -> str:
                 seen_types.add(key)
                 type_chips.append(
                     f'<button type="button" class="gr-chip" data-dim="type" '
-                    f'data-val="{escape_html(key)}">{escape_html(label)}</button>'
+                    f'data-val="{escape_html(key)}">'
+                    f"{escape_html(_CHIP_LABELS.get(key, label))}</button>"
                 )
         repo = entry.get("repo", "")
         if repo and repo not in seen_repos:
@@ -576,8 +604,9 @@ def _render_chips(model: dict) -> str:
 
 
 def _render_attention(model: dict) -> str:
-    """Left column: search box, chips, New section, populated bucket
-    sections — or the empty-state card when nothing needs attention."""
+    """Left column: search box, chips, the New section when non-empty,
+    populated bucket sections — or the empty-state card when nothing needs
+    attention (spec: empty tiers are omitted)."""
     att = model.get("attention") or {}
     new_groups = (att.get("new") or {}).get("groups", [])
     buckets = [b for b in att.get("buckets", []) if b.get("groups")]
@@ -587,8 +616,9 @@ def _render_attention(model: dict) -> str:
         '<input type="search" class="gr-search" placeholder="Filter\u2026" '
         'aria-label="Filter attention items">',
         _render_chips(model),
-        _render_section("New since last review", new_groups, "new"),
     ]
+    if new_groups:  # empty tiers are omitted (BUG-01)
+        parts.append(_render_section("New since last review", new_groups, "new"))
     parts += [
         _render_section(
             bucket.get("label", bucket.get("key", "")),
@@ -625,8 +655,8 @@ def _render_stale(model: dict) -> str:
 
 def _render_summary_card(model: dict) -> str:
     """Inline CI/stale summaries derived at render time from the attention
-    items (badge keys, mirroring the KPI counts) — never filtered by the
-    Task 6 search/chips and never counted there."""
+    items' kinds ("ci_failure"/"stale_pr", mirroring the KPI counts) — never
+    filtered by the Task 6 search/chips and never counted there."""
 
     def _list(entries: list[dict]) -> str:
         if not entries:
@@ -640,8 +670,8 @@ def _render_summary_card(model: dict) -> str:
         return f'<div class="gr-sum-list">{rows}</div>'
 
     items = _attention_items(model)
-    ci = [e for e in items if "ci" in _badge_keys(e)]
-    stale = [e for e in items if "stale" in _badge_keys(e)]
+    ci = [e for e in items if "ci_failure" in e.get("kinds", [])]
+    stale = [e for e in items if "stale_pr" in e.get("kinds", [])]
     return (
         '<div class="gr-card"><h2>Needs summary</h2>'
         "<h3>CI failures</h3>"
@@ -652,14 +682,15 @@ def _render_summary_card(model: dict) -> str:
 
 
 def _render_activity_card(model: dict) -> str:
-    """Recent activity from the nested provider model. Providers without
-    renderable groups and groups without categories are skipped (the Task 3
+    """Recent activity from the nested provider model. Categories with no
+    items render nothing, groups whose categories are all empty are skipped,
+    and providers without any renderable groups are dropped (the Task 3
     empty a/b case); category labels come from the model. Titles are raw
     provider text — escaped here."""
     providers = [
         p
         for p in (model.get("activity") or {}).get("providers", [])
-        if any(g.get("categories") for g in p.get("groups", []))
+        if any(any(c.get("items") for c in g.get("categories", [])) for g in p.get("groups", []))
     ]
     if not providers:
         return ""
@@ -667,7 +698,7 @@ def _render_activity_card(model: dict) -> str:
     for p in providers:
         repo_blocks = []
         for g in p.get("groups", []):
-            categories = g.get("categories") or []
+            categories = [c for c in (g.get("categories") or []) if c.get("items")]
             if not categories:
                 continue
             visibility = g.get("visibility") or ""
