@@ -11,6 +11,10 @@ A CLI tool to gather a user's Git activity from configured Git providers (e.g., 
 *   Empty categories, repositories, and providers are omitted from the report.
 *   Attention digest: a daily "what needs my attention" inbox with an
     ack/unack lifecycle, catch-up-safe scheduling, and Markdown/HTML digests.
+    The HTML digest is a self-contained dark dashboard: KPI strip, two-column
+    body, collapsible repo groups, PR/issue/bug/MP/CI badges, humanized ages
+    ("2 months ago"), search plus type/age/repo filter chips, inline JS, no
+    network.
 *   Configurable via a YAML file.
 *   Flexible date handling, including natural language.
 
@@ -173,7 +177,9 @@ Beyond the standalone `generate` report, gitreport can run as a **daily
 digest**: each morning it collects what needs your attention (GitHub
 notifications and queries, Launchpad items) plus your recent activity, writes
 the digest to disk, and keeps an inbox-style state so items stop nagging once
-you have dealt with them.
+you have dealt with them. The digest Markdown is categorized — repo groups
+with Today / Last 7 days / Last 30 days / Older buckets, type tags, and
+humanized ages.
 
 ### Commands
 
@@ -365,8 +371,8 @@ existing configurations keep working.
 | `exclusions` | `{}` | Per-provider glob patterns matched against `owner/repo` (GitHub) or the project name (Launchpad). Applies to attention items only; the activity report is unchanged. |
 | `stale_pr_days` | `7` | Flag your open PRs as stale after this many days without updates. |
 | `state_path` | `~/.local/state/gitreport/state.json` | Location of the inbox state file (see [State file](#state-file)). |
-| `digest_formats` | `[html, md]` | Published digest formats. The `.md` file is always written (it is infrastructure for `gitreport read`); omitting it is a configuration error. Omitting `html` skips the HTML file and makes `--open` open the `.md`. |
-| `digest_output` | `~/.local/state/gitreport/digests/YYYY-MM-DD` | Extension-less stem for the dated digest; the `YYYY-MM-DD` token is replaced with the local date. Files are `<stem>.md` / `<stem>.html`; same-day reruns overwrite them. |
+| `digest_formats` | `[html, md]` | Published digest formats. The `.md` and `.json` files are always written (renderer infrastructure for `gitreport read`; the `.json` has no symlink); omitting `md` is a configuration error. Omitting `html` skips the HTML file and makes `--open` open the `.md`. |
+| `digest_output` | `~/.local/state/gitreport/digests/YYYY-MM-DD` | Extension-less stem for the dated digest; the `YYYY-MM-DD` token is replaced with the local date. Files are `<stem>.md` / `<stem>.json` / `<stem>.html`; same-day reruns overwrite them. |
 | `digest_latest` | `~/.local/state/gitreport/digests/latest` | Extension-less stem refreshed (symlinked) to the newest digest on every run. |
 
 ## State file

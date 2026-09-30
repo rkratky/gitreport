@@ -214,6 +214,9 @@ persisting query match is not a new event).
   in local time. Un-acked and reopened items are marked "re-opened" here
   (the marker is `reopen_count > 0`); they keep their original `first_seen`.
 
+<!-- Amended 2026-09-30: see docs/superpowers/specs/2026-09-30-html-dashboard-design.md -->
+Amended 2026-09-30: still-open buckets are Today / Last 7 days / Last 30 days / Older, superseding the three-bucket wording above.
+
 ### Leave
 
 An item leaves the inbox on ack, or when auto-resolution sets
@@ -280,6 +283,10 @@ never reviewed behaves as if it were never generated:
     09:14" (from `reviewed_at`) after. `read` replaces that one line in the
     cached `.md` text and re-runs the one HTML renderer — milliseconds, no
     network, no special-case code.
+
+<!-- Amended 2026-09-30: see docs/superpowers/specs/2026-09-30-html-dashboard-design.md -->
+Amended 2026-09-30: `read` re-renders the HTML from the `.json` snapshot, not from the cached `.md`; the `.md` is only re-stamped.
+
 - A single missed day costs nothing; an unreviewed week accumulates into
   one wide window, exactly like a missed period. There is deliberately no
   interactive prompt at generation time (cron must never hang); the status
@@ -412,6 +419,9 @@ attention:
   read` requires the `md` digest format"). Omitting `html` skips the HTML
   file and makes `read --open` / `digest --open` open the `.md`.
 
+<!-- Amended 2026-09-30: see docs/superpowers/specs/2026-09-30-html-dashboard-design.md -->
+Amended 2026-09-30: the `.json` snapshot is also written on every digest run (no symlink) — `.md` and `.json` are both renderer infrastructure.
+
 ## CLI surface
 
 - `gitreport generate ...` — unchanged; standalone activity report for any
@@ -447,6 +457,10 @@ running `gitreport digest` daily. A missed schedule costs nothing; see
   carries the coverage line and the `Status:` line. `html_report.py` strips
   the front matter, converts the body via the `markdown` library (new
   dependency), and wraps it in a minimal HTML template with inline CSS.
+
+<!-- Amended 2026-09-30: see docs/superpowers/specs/2026-09-30-html-dashboard-design.md -->
+Amended 2026-09-30: the dashboard renders from the report model / `.json` snapshot, not from a Markdown conversion; the `markdown` conversion path above is retained only as the pre-upgrade fallback.
+
 - **Injection**: user-supplied strings (titles, reasons, logins, repo names)
   are escaped for both HTML and Markdown metacharacters before they enter
   the Markdown. Links are emitted only from trusted `url` fields and only
@@ -533,6 +547,9 @@ and relies on atomic rename for a consistent snapshot.
   (`javascript:` links, images, Markdown metacharacters); status-line
   re-render round-trip (generate -> read -> re-render changes only the
   `Status:` line).
+
+<!-- Amended 2026-09-30: see docs/superpowers/specs/2026-09-30-html-dashboard-design.md -->
+Amended 2026-09-30: the `read` restamp guarantee is that only the status banner changes, not only the `Status:` line.
 
 ## Future seams (explicitly out of scope for v1)
 
