@@ -228,7 +228,7 @@ def test_dashboard_dark_theme_static(utc_tz):
     assert "--gr-bg" in html
     assert "#111318" in html
     assert "--gr-brand:#e95420" in html
-    assert "<script" not in html  # static until Task 6
+    assert html.count("<script") == 1  # Task 6: exactly one inline script
     assert "<img" not in html
     assert "src=" not in html
     # Every href is a model item link (rows + right-column summaries), nothing else.
@@ -531,7 +531,10 @@ def test_dashboard_chips_fixed_labels_mp(utc_tz):
     }
     html = render_dashboard_html(_dash_model(items))
     assert html.count('data-dim="type" data-val="mp"') == 1
-    assert '<button type="button" class="gr-chip" data-dim="type" data-val="mp">MP</button>' in html
+    assert (
+        '<button type="button" class="gr-chip" data-dim="type" data-val="mp" '
+        'aria-pressed="false">MP</button>'
+    ) in html
     assert '<span class="gr-badge gr-badge--mp">MP</span>' in html
     assert '<span class="gr-badge gr-badge--mp">MP review</span>' in html
 
@@ -555,7 +558,7 @@ def test_dashboard_activity_skips_empty_categories(utc_tz):
     repo["prs_merged"].append({"title": "M", "url": "https://x/2"})
     model = _dash_model({}, activity={"github": {"o/r": repo}})
     cats = model["activity"]["providers"][0]["groups"][0]["categories"]
-    cats.append({"key": "prs_reviewed", "label": "PRs reviewed", "items": []})
+    cats.append({"key": "prs_submitted", "label": "PRs submitted", "items": []})
     model["activity"]["providers"][0]["groups"].append(
         {
             "repo": "o/empty",
@@ -568,3 +571,73 @@ def test_dashboard_activity_skips_empty_categories(utc_tz):
     assert "o/empty" not in html
     assert "PRs submitted" not in html
     assert 'href="https://x/2">M</a>' in html
+
+
+# --- Task 6: inline JS interactions (static DOM contract, no browser) --------
+
+
+def _dash_script(page: str) -> str:
+    """Extract the single inline <script> block from a rendered dashboard."""
+    assert page.count("<script") == 1  # exactly one block
+    assert page.count("</script>") == 1
+    start = page.index("<script")
+    end = page.index("</script>", start)
+    return page[start:end]
+
+
+def test_dashboard_inline_script_contract(utc_tz):
+    page = render_dashboard_html(_dash_model(_dash_items()))
+    script = _dash_script(page)
+    # Inline only: no src attribute anywhere on the page, and no network
+    # calls — the page stays self-contained.
+    assert "src=" not in page
+    assert "fetch(" not in page
+    assert "XMLHttpRequest" not in page
+    # Interaction markers: event listeners, the shared filter routine, chip
+    # toggling and data-* substring matching over the row payload.
+    assert "addEventListener" in script
+    assert "applyFilters" in script
+    assert "aria-pressed" in script
+    assert 'getAttribute("data-text")' in script
+    assert 'getAttribute("data-type")' in script
+    assert 'getAttribute("data-age")' in script
+    assert 'getAttribute("data-repo")' in script
+    # Every sessionStorage access must sit inside a try (in-memory fallback):
+    # a `try` appears within 200 chars before each occurrence.
+    for match in re.finditer("sessionStorage", script):
+        assert "try" in script[max(0, match.start() - 200) : match.start()]
+
+
+def test_dashboard_generated_at_body_attr(utc_tz):
+    # Storage keys are <generated_at>:<section>:<repo>; the timestamp comes
+    # from a data-generated-at attribute on <body> and the script builds on it.
+    page = render_dashboard_html(_dash_model(_dash_items()))
+    assert '<body data-generated-at="2026-09-28T06:00:00+00:00">' in page
+    assert "data-generated-at" in _dash_script(page)
+
+
+def test_dashboard_toolbar_count_and_no_js_visibility(utc_tz):
+    page = render_dashboard_html(_dash_model(_dash_items()))
+    assert 'id="gr-search"' in page
+    # Initial render is the no-JS view: an empty search shows "M of M".
+    assert '<span id="gr-count" class="gr-count">2 of 2 items</span>' in page
+    assert 'id="gr-collapse-all"' in page
+    assert 'id="gr-expand-all"' in page
+    # Nothing is hidden at render time: no element carries a hidden attribute.
+    assert re.search(r"<[a-zA-Z][^>]*\shidden[\s=>]", page) is None
+
+
+def test_dashboard_chips_render_unpressed(utc_tz):
+    page = render_dashboard_html(_dash_model(_dash_items()))
+    pressed = re.findall(r'data-dim="[a-z]+" data-val="[^"]*" aria-pressed="false"', page)
+    assert len(pressed) == 10  # 3 type + 5 age + 2 repo
+
+
+def test_dashboard_kpi_click_contract(utc_tz):
+    # KPI cards act as filter shortcuts: the script selects them and maps
+    # each card onto its chip set per the spec table.
+    page = render_dashboard_html(_dash_model(_dash_items()))
+    script = _dash_script(page)
+    assert ".gr-kpi" in script
+    for val in ("new", "today", "week", "month", "older", "issue", "ci", "stale"):
+        assert f'"{val}"' in script

@@ -119,16 +119,16 @@ def render_html(md_text: str, title: str = "GitReport digest") -> str:
     return _TEMPLATE.format(title=html.escape(title), body=rendered)
 
 
-# --- dashboard (Task 5: dark theme, static, from the report model) -----------
+# --- dashboard (Task 5+6: dark theme, model-based, inline interactions) ------
 #
 # The renderer consumes the report model only. The model carries PLAIN text
 # (state-stored titles/reasons are unescaped upstream, activity titles arrive
 # raw): every dynamic string goes through escape_html here, attribute values
 # included. URLs are guarded again by attention._safe_url (the single guard
 # both renderers share) — html.escape alone cannot neutralise a javascript:
-# href, so an unsafe URL degrades to plain text. The page is fully static:
-# no <script> yet (Task 6 adds inline JS that reads the DOM only), no <img>,
-# no external references.
+# href, so an unsafe URL degrades to plain text. The page carries one inline
+# <script> (Task 6) that reads only DOM text and data-* attributes — the
+# model JSON is never embedded; no <img>, no external references.
 
 _DARK_CSS = """
 :root {
@@ -215,6 +215,7 @@ a { color: var(--gr-info); }
   display: flex;
   flex-direction: column;
   box-shadow: var(--gr-shadow);
+  cursor: pointer;
 }
 .gr-kpi-value { font-size: 1.35rem; font-weight: 650; }
 .gr-kpi-label {
@@ -254,6 +255,15 @@ a { color: var(--gr-info); }
   border-radius: var(--gr-radius-sm);
   font: inherit;
 }
+.gr-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.gr-toolbar .gr-search { flex: 1 1 14rem; width: auto; margin-bottom: 0; }
+.gr-count { color: var(--gr-muted); font-size: 0.78rem; }
 .gr-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.75rem; }
 .gr-chip {
   border: 1px solid var(--gr-border);
@@ -264,6 +274,11 @@ a { color: var(--gr-info); }
   font: inherit;
   font-size: 0.75rem;
   cursor: pointer;
+}
+.gr-chip[aria-pressed="true"] {
+  color: var(--gr-text);
+  border-color: var(--gr-brand);
+  background: rgba(233, 84, 32, 0.16);
 }
 .gr-repo {
   background: var(--gr-card);
@@ -398,6 +413,252 @@ _AGE_CHIPS = [
     ("month", "Last 30 days"),
     ("older", "Older"),
 ]
+
+# The inline interaction script (Task 6): vanilla, ES5-style, no network
+# calls, reads only DOM text and data-* attributes — the model JSON is never
+# embedded in the page. Rendered once, immediately before </body>, so every
+# element above it is already parsed.
+_DASH_JS = r"""(function () {
+  "use strict";
+
+  // Dashboard interactions (Task 6). The page is fully usable without this
+  // script: everything renders visible and unfiltered. The script reads only
+  // DOM text and data-* attributes — the model JSON is never embedded — and
+  // makes no network calls.
+
+  var search = null;
+  var countEl = null;
+  var chips = [];
+  var rows = [];
+  var groups = [];
+  var sections = [];
+  var generatedAt = "";
+  var memStore = {};
+
+  // Storage access wrapped in try/catch — sessionStorage may be blocked or
+  // full (private browsing); an in-memory map then keeps state page-wide.
+  function storageGet(key) {
+    var value;
+    try {
+      value = sessionStorage.getItem(key);
+    } catch (err) {
+      value = memStore[key];
+    }
+    return value;
+  }
+
+  function storageSet(key, value) {
+    try {
+      sessionStorage.setItem(key, value);
+    } catch (err) {
+      memStore[key] = value;
+    }
+  }
+
+  // Collapsible state key: <generated_at>:<section>:<repo>, where section is
+  // the bucket key carried by the group's data-age attribute.
+  function groupKey(group) {
+    return [
+      generatedAt,
+      group.getAttribute("data-age") || "",
+      group.getAttribute("data-repo") || "",
+    ].join(":");
+  }
+
+  function restoreOpen(group) {
+    var stored = storageGet(groupKey(group));
+    if (stored === "0") {
+      group.open = false;
+    } else if (stored === "1") {
+      group.open = true;
+    }
+  }
+
+  function persistOpen(group) {
+    storageSet(groupKey(group), group.open ? "1" : "0");
+  }
+
+  function toggleChip(chip) {
+    chip.setAttribute(
+      "aria-pressed",
+      chip.getAttribute("aria-pressed") === "true" ? "false" : "true"
+    );
+  }
+
+  // data-val values pressed within one dimension; an empty selection matches
+  // every row (OR within the dimension, AND across dimensions).
+  function pressedValues(dimension) {
+    var values = {};
+    chips.forEach(function (chip) {
+      if (
+        chip.getAttribute("data-dim") === dimension &&
+        chip.getAttribute("aria-pressed") === "true"
+      ) {
+        values[chip.getAttribute("data-val")] = true;
+      }
+    });
+    return values;
+  }
+
+  // A row stays visible iff the search and every chip dimension match; an
+  // empty search or dimension selection always matches. Empty groups and
+  // sections are hidden live and the "N of M" count is refreshed.
+  function applyFilters() {
+    var query = search && search.value ? search.value.trim().toLowerCase() : "";
+    var typeSel = pressedValues("type");
+    var ageSel = pressedValues("age");
+    var repoSel = pressedValues("repo");
+    var visible = 0;
+    rows.forEach(function (row) {
+      var text = (row.getAttribute("data-text") || "").toLowerCase();
+      var ok = true;
+      if (query && text.indexOf(query) === -1) {
+        ok = false;
+      }
+      if (ok && Object.keys(typeSel).length) {
+        ok = (row.getAttribute("data-type") || "")
+          .split(/\s+/)
+          .some(function (key) {
+            return key !== "" && typeSel[key];
+          });
+      }
+      if (ok && Object.keys(ageSel).length) {
+        ok = !!ageSel[row.getAttribute("data-age") || ""];
+      }
+      if (ok && Object.keys(repoSel).length) {
+        ok = !!repoSel[row.getAttribute("data-repo") || ""];
+      }
+      row.hidden = !ok;
+      if (ok) {
+        visible += 1;
+      }
+    });
+    groups.forEach(function (group) {
+      group.hidden = !rows.some(function (row) {
+        return !row.hidden && group.contains(row);
+      });
+    });
+    sections.forEach(function (section) {
+      section.hidden = !rows.some(function (row) {
+        return !row.hidden && section.contains(row);
+      });
+    });
+    if (countEl) {
+      countEl.textContent = visible + " of " + rows.length + " items";
+    }
+  }
+
+  // KPI cards double as filter shortcuts (spec mapping): each toggles its
+  // chip set as a group — all on when not all were on, all off otherwise.
+  var KPI_FILTERS = {
+    new: [["age", "new"]],
+    still_open: [["age", "today"], ["age", "week"], ["age", "month"], ["age", "older"]],
+    assigned: [["type", "issue"]],
+    ci_failing: [["type", "ci"]],
+    stale_prs: [["type", "stale"]],
+  };
+
+  function findChip(dimension, value) {
+    var found = null;
+    chips.forEach(function (chip) {
+      if (
+        found === null &&
+        chip.getAttribute("data-dim") === dimension &&
+        chip.getAttribute("data-val") === value
+      ) {
+        found = chip;
+      }
+    });
+    return found;
+  }
+
+  function wireKpiCards() {
+    [].slice.call(document.querySelectorAll(".gr-kpi[data-kpi]")).forEach(
+      function (card) {
+        // Clickability is a script enhancement: without JS the cards stay
+        // plain, non-interactive divs.
+        card.setAttribute("role", "button");
+        card.setAttribute("tabindex", "0");
+        var activate = function () {
+          var mapped = (KPI_FILTERS[card.getAttribute("data-kpi")] || [])
+            .map(function (spec) {
+              return findChip(spec[0], spec[1]);
+            })
+            .filter(function (chip) {
+              return chip !== null;
+            });
+          if (mapped.length === 0) {
+            return;
+          }
+          var allOn = mapped.every(function (chip) {
+            return chip.getAttribute("aria-pressed") === "true";
+          });
+          mapped.forEach(function (chip) {
+            chip.setAttribute("aria-pressed", allOn ? "false" : "true");
+          });
+          applyFilters();
+        };
+        card.addEventListener("click", activate);
+        card.addEventListener("keydown", function (event) {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            activate();
+          }
+        });
+      }
+    );
+  }
+
+  function init() {
+    search = document.getElementById("gr-search");
+    countEl = document.getElementById("gr-count");
+    chips = [].slice.call(document.querySelectorAll(".gr-chip[data-dim]"));
+    rows = [].slice.call(document.querySelectorAll(".gr-item"));
+    groups = [].slice.call(document.querySelectorAll("details.gr-repo"));
+    sections = [].slice.call(document.querySelectorAll(".gr-section"));
+    generatedAt = document.body.getAttribute("data-generated-at") || "";
+    if (search) {
+      search.addEventListener("input", applyFilters);
+    }
+    chips.forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        toggleChip(chip);
+        applyFilters();
+      });
+    });
+    groups.forEach(function (group) {
+      restoreOpen(group);
+      group.addEventListener("toggle", function () {
+        persistOpen(group);
+      });
+    });
+    var collapseAll = document.getElementById("gr-collapse-all");
+    var expandAll = document.getElementById("gr-expand-all");
+    if (collapseAll) {
+      collapseAll.addEventListener("click", function () {
+        groups.forEach(function (group) {
+          group.open = false;
+        });
+      });
+    }
+    if (expandAll) {
+      expandAll.addEventListener("click", function () {
+        groups.forEach(function (group) {
+          group.open = true;
+        });
+      });
+    }
+    wireKpiCards();
+    applyFilters();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+"""
 
 
 def escape_html(s) -> str:
@@ -572,9 +833,10 @@ _CHIP_LABELS = {
 
 
 def _render_chips(model: dict) -> str:
-    """Filter chips (decorative until Task 6): one per type key present with
-    its fixed label, the fixed age set, one per repo group — deduped in
-    model order."""
+    """Filter chips as toggle buttons (aria-pressed starts false; the inline
+    script wires clicking and filtering): one per type key present with its
+    fixed label, the fixed age set, one per repo group — deduped in model
+    order."""
     type_chips: list[str] = []
     seen_types: set[str] = set()
     repo_chips: list[str] = []
@@ -585,7 +847,7 @@ def _render_chips(model: dict) -> str:
                 seen_types.add(key)
                 type_chips.append(
                     f'<button type="button" class="gr-chip" data-dim="type" '
-                    f'data-val="{escape_html(key)}">'
+                    f'data-val="{escape_html(key)}" aria-pressed="false">'
                     f"{escape_html(_CHIP_LABELS.get(key, label))}</button>"
                 )
         repo = entry.get("repo", "")
@@ -593,14 +855,33 @@ def _render_chips(model: dict) -> str:
             seen_repos.add(repo)
             repo_chips.append(
                 f'<button type="button" class="gr-chip" data-dim="repo" '
-                f'data-val="{escape_html(repo)}">{escape_html(repo)}</button>'
+                f'data-val="{escape_html(repo)}" aria-pressed="false">'
+                f"{escape_html(repo)}</button>"
             )
     age_chips = [
-        f'<button type="button" class="gr-chip" data-dim="age" data-val="{key}">'
-        f"{escape_html(label)}</button>"
+        f'<button type="button" class="gr-chip" data-dim="age" data-val="{key}" '
+        f'aria-pressed="false">{escape_html(label)}</button>'
         for key, label in _AGE_CHIPS
     ]
     return f'<div class="gr-chips">{"".join(type_chips + age_chips + repo_chips)}</div>'
+
+
+def _render_toolbar(model: dict) -> str:
+    """Search box, live "N of M" count (server-rendered as M of M with no
+    filters — the script refreshes it on every change) and the collapse /
+    expand controls for the repo groups."""
+    total = len(_attention_items(model))
+    return (
+        '<div class="gr-toolbar">'
+        '<input type="search" id="gr-search" class="gr-search" '
+        'placeholder="Filter\u2026" aria-label="Filter attention items">'
+        f'<span id="gr-count" class="gr-count">{total} of {total} items</span>'
+        '<button type="button" id="gr-collapse-all" class="gr-chip">'
+        "Collapse all</button>"
+        '<button type="button" id="gr-expand-all" class="gr-chip">'
+        "Expand all</button>"
+        "</div>"
+    )
 
 
 def _render_attention(model: dict) -> str:
@@ -613,8 +894,7 @@ def _render_attention(model: dict) -> str:
     if not new_groups and not buckets:
         return '<div class="gr-card gr-empty">Nothing to show.</div>'
     parts = [
-        '<input type="search" class="gr-search" placeholder="Filter\u2026" '
-        'aria-label="Filter attention items">',
+        _render_toolbar(model),
         _render_chips(model),
     ]
     if new_groups:  # empty tiers are omitted (BUG-01)
@@ -739,9 +1019,11 @@ def render_dashboard_html(model: dict) -> str:
     Header (title, coverage line with first-run suffix, "ages as of" caption,
     status pill), the always-rendered KPI strip, the stale-provider banner,
     then the two-column body: attention (search + chips + sections) left,
-    Needs summary + Recent activity right. Everything is static HTML — the
-    Task 6 script will read only the DOM and data-* attributes, so the model
-    JSON is never embedded in the page.
+    Needs summary + Recent activity right. Interactions (search, chips,
+    collapsibles, KPI shortcuts) live in one inline script that reads only
+    DOM text and data-* attributes — the model JSON is never embedded in the
+    page, and the page degrades to a fully expanded, unfiltered view without
+    JavaScript.
     """
     coverage = model.get("coverage") or {}
     days = _coverage_days(coverage)
@@ -775,6 +1057,7 @@ def render_dashboard_html(model: dict) -> str:
         + _render_kpis(model)
         + f'<div class="gr-cols">{left}{right}</div>'
     )
+    generated_at = escape_html(model.get("generated_at") or "")
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n'
@@ -784,8 +1067,9 @@ def render_dashboard_html(model: dict) -> str:
         "<title>GitReport digest</title>\n"
         f"<style>{_DARK_CSS}</style>\n"
         "</head>\n"
-        "<body>\n"
+        f'<body data-generated-at="{generated_at}">\n'
         f"{body}\n"
+        f"<script>\n{_DASH_JS}</script>\n"
         "</body>\n"
         "</html>\n"
     )
