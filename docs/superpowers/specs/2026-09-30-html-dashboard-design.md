@@ -28,8 +28,9 @@ a dark theme.
 3. Inline JavaScript (vanilla, zero dependencies) for search, filter chips,
    collapsibles, and live counts. The file remains self-contained: no
    network, no external references, works from `file://`.
-4. The canonical Markdown digest (`.md`, CLI stdout, tests) is unchanged.
-   The dashboard is a second view over the same report model.
+4. The Markdown digest (`.md`, CLI stdout) gains the same categorization in
+   plain-text form — repo groups, the four age buckets, humanized ages and
+   type tags — staying readable, pipeable Markdown throughout.
 
 ## Non-goals (v1)
 
@@ -46,6 +47,7 @@ a dark theme.
 | JavaScript | Allowed: inline, vanilla, zero-dependency, self-contained file; dark theme. **Amends the parent spec's "no JavaScript" constraint for the HTML digest** (the `.md` and CLI output are unaffected) |
 | Default organisation | New / Still open tiers preserved; within each, collapsible groups per repo, sorted newest-first; search + repo/type/age filter chips above |
 | Age display | Per-item humanized badge (day/week/month/year, largest two units) + four bucket sections for Still open: Today / Last 7 days / Last 30 days / Older |
+| Markdown categorization | The `.md`/stdout digest mirrors the dashboard structure in plain text: New + four Still-open buckets, `#### repo` groups within each, per-item humanized age and type tag; `generate` (activity report) is unchanged |
 | HTML data source | Structured report model (Approach A): the model is the shared input of both renderers; a `.json` snapshot is written each digest run as renderer infrastructure (dated file: `<stem>.json`) |
 | Inspiration | foundations-engineering dashboards' card/KPI/badge/status-banner language, dark-tuned |
 
@@ -160,16 +162,27 @@ as today), `reasons[]`, `kind`, `type_badge` (derived), `age` (humanized),
 
 ## CLI & artifacts
 
-- `digest` prints the same Markdown as today (snapshot tests must not
-  change) and writes dated `.md` + `.json` always, `.html` when
-  `html` is in `digest_formats`. Symlinks refresh for `.md`/`.html` as
-  today; `.json` gets no symlink (infrastructure).
+- `digest` prints a **categorized Markdown digest** — same data, same
+  organization as the dashboard, in plain text: `## Needs attention` holds
+  "New since last review" and the four Still-open buckets (Today / Last 7
+  days / Last 30 days / Older); within every section, items are grouped
+  under `#### <repo>` headings; each item line carries its title link,
+  type tag (`(PR review)`, `(issue)`, `(bug)`, `(MP)`, `(mention)`,
+  `(CI)`, `(stale)`, `(comment)`, `(thread)`), humanized age
+  (`2 months ago`), and "re-opened" marker where applicable, with reason
+  lines beneath. `## Recent activity` is unchanged. This replaces today's
+  flat item lists; the "byte-identical output" guarantee is dropped — the
+  snapshot tests are updated to the new structure. `generate` (the
+  standalone activity report) remains unchanged.
+- `digest` writes dated `.md` + `.json` always, `.html` when `html` is in
+  `digest_formats`. Symlinks refresh for `.md`/`.html` as today; `.json`
+  gets no symlink (infrastructure).
 - `read --open` / `digest --open` open `.html` (fallback `.md` as today).
 - `read` re-stamps the `.md` `Status:` line and re-renders `.html` from the
   cached `.json` with the new status banner. If `.json` is missing or
   corrupt, `read` warns and updates the `.md` only (HTML keeps its old
   banner until the next digest).
-- `attention` is unchanged.
+- `attention` renders the same categorized Markdown to stdout (dry run).
 
 ## Error handling
 
@@ -194,7 +207,9 @@ as today), `reasons[]`, `kind`, `type_badge` (derived), `age` (humanized),
   `.json`->HTML byte-identical to direct render.
 - `read` round-trip: generate -> read re-renders HTML with only the banner
   changed; missing `.json` -> warn + `.md`-only restamp.
-- CLI snapshot: `digest` Markdown output byte-identical to today.
+- Markdown renderer (from model): repo groups, four buckets, humanized
+  ages, type tags, re-opened markers, coverage/status/front-matter lines;
+  `generate` output snapshot unchanged.
 
 ## Future seams
 
