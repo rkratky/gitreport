@@ -4,9 +4,40 @@ import copy
 import re
 from datetime import UTC, datetime, timedelta
 
+from .providers.base import unescape_user
+from .state import AttentionState, ItemState
+
 MAX_REASONS = 10
-BUCKETS = ("today", "week", "older")
-BUCKET_TITLES = {"today": "Today", "week": "Last 7 days", "older": "Older than 7 days"}
+BUCKETS = ("today", "week", "month", "older")
+BUCKET_TITLES = {"today": "Today", "week": "Last 7 days", "month": "Last 30 days", "older": "Older"}
+
+# Type badges for the report model, derived from item kinds (no provider
+# changes). Precedence: CI > PR review > thread > issue > bug > MP > mention >
+# comment > stale; unknown kinds render the muted "item" badge, last.
+BADGE_BY_KIND = {
+    "ci_failure": ("CI", "ci"),
+    "review_requested": ("PR review", "pr"),
+    "thread_unresolved": ("thread", "thread"),
+    "issue_assigned": ("issue", "issue"),
+    "lp_bug_activity": ("bug", "bug"),
+    "lp_mp_comment": ("MP", "mp"),
+    "lp_mp_needs_review": ("MP review", "mp"),
+    "stale_pr": ("stale", "stale"),
+    "mention": ("mention", "mention"),
+    "comment": ("comment", "comment"),
+}
+BADGE_PRECEDENCE = [
+    "ci",
+    "pr",
+    "thread",
+    "issue",
+    "bug",
+    "mp",
+    "mention",
+    "comment",
+    "stale",
+    "item",
+]
 
 # Launchpad kinds whose queries are time-windowed by `since`: falling out of
 # the window is normal ageing, not a leave path, so these records are never
@@ -20,6 +51,36 @@ WINDOWED_KINDS = frozenset({"lp_bug_activity", "lp_mp_comment"})
 # characters that would break the [title](url) syntax or smuggle markup.
 _URL_UNSAFE = re.compile(r"[\s()<>\"'`]")
 _EPOCH = datetime.min.replace(tzinfo=UTC)
+
+
+def _safe_url(url: str) -> str | None:
+    """The URL when safe to render as a [title](url) link, else None.
+
+    A URL is safe only when it is http(s) and free of characters that would
+    break the Markdown link syntax or smuggle markup (_URL_UNSAFE). The
+    single guard both renderers and the report model go through.
+    """
+    if url.startswith(("http://", "https://")) and not _URL_UNSAFE.search(url):
+        return url
+    return None
+
+
+def badges_for(kinds: list[str], provider: str | None) -> list[tuple[str, str]]:
+    """Distinct type badges in precedence order for an item's kinds.
+
+    issue_assigned renders the bug badge under the Launchpad provider
+    taxonomy; unknown kinds fall back to the muted item badge, ordered last.
+    """
+    out: list[tuple[str, str]] = []
+    for kind in kinds or []:
+        if kind == "issue_assigned" and provider == "launchpad":
+            badge = ("bug", "bug")
+        else:
+            badge = BADGE_BY_KIND.get(kind, ("item", "item"))
+        if badge not in out:
+            out.append(badge)
+    out.sort(key=lambda b: BADGE_PRECEDENCE.index(b[1]))
+    return out
 
 
 def humanize_age(ts: str | None, now: datetime) -> str:
@@ -75,6 +136,24 @@ def _parse(ts: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def age_bucket(last_updated: str | None, now: datetime) -> str:
+    """Bucket for a still-open item's last_updated, evaluated in order, first
+    match wins, all boundaries inclusive: today = same local calendar date as
+    `now`; week = >= now - 7d; month = >= now - 30d; else older. Unparseable
+    input buckets as older (defensive; sorted last)."""
+    dt = _parse(last_updated)
+    if dt is None:
+        return "older"
+    local_dt, local_now = dt.astimezone(), now.astimezone()
+    if local_dt.date() == local_now.date():
+        return "today"
+    if local_dt >= local_now - timedelta(hours=168):
+        return "week"
+    if local_dt >= local_now - timedelta(hours=720):
+        return "month"
+    return "older"
 
 
 def _is_later(a: str | None, b: str | None) -> bool:
@@ -278,6 +357,150 @@ def build_report(state: dict, now: datetime) -> dict:
     return {"new": new_items, **buckets}
 
 
+def _recency_sort_key(ts: str | None) -> float:
+    """Ascending sort key for a last_updated string: newest item first.
+
+    Negated epoch seconds (a newer timestamp sorts smaller); unparseable
+    input returns +inf so it always sorts last. Pair with a stable pre-sort
+    by id for the id-ascending tie-break.
+    """
+    dt = _parse(ts)
+    if dt is None:
+        return float("inf")
+    return -dt.timestamp()
+
+
+def _item_entry(mid: str, r: ItemState, now: datetime, bucket: str) -> dict:
+    """One attention item for the report model.
+
+    The model carries plain text: title/reasons pass through unescape_user
+    (state stores them markdown-escaped; escaping happens only at render
+    time). url is scheme-guarded here — an unsafe URL degrades to "" so no
+    renderer can link it by accident.
+    """
+    return {
+        "id": mid,
+        "repo": r.repo or "",
+        "title": unescape_user(r.title or ""),
+        "url": _safe_url(r.url or "") or "",
+        "reasons": [unescape_user(reason) for reason in r.reasons],
+        "kinds": list(r.kinds),
+        "type_badges": badges_for(list(r.kinds), r.provider),
+        "age": humanize_age(r.last_updated, now),
+        "age_bucket": bucket,
+        "last_updated": r.last_updated or "",
+        "reopened": r.reopen_count > 0,
+    }
+
+
+def _repo_groups(items: list[dict]) -> list[dict]:
+    """Group model items by repo, groups ordered by newest item descending
+    (tie: repo name ascending). Items must already be newest-first, so each
+    group's first item is its newest."""
+    by_repo: dict[str, list[dict]] = {}
+    for entry in items:
+        by_repo.setdefault(entry["repo"], []).append(entry)
+
+    def _group_order(pair: tuple[str, list[dict]]) -> tuple[float, str]:
+        repo, entries = pair
+        return (_recency_sort_key(entries[0]["last_updated"]), repo)
+
+    return [
+        {"repo": repo, "items": entries}
+        for repo, entries in sorted(by_repo.items(), key=_group_order)
+    ]
+
+
+def report_model(
+    state: AttentionState,
+    *,
+    generated_at: str,
+    coverage_start: str,
+    first_run: bool,
+    stale_providers: list[str],
+    activity_data: dict | None = None,
+) -> dict:
+    """Build the plain-JSON report model consumed by both renderers.
+
+    New tier: every open item when `first_run`; otherwise first_seen after
+    last_reviewed — an unparseable last_reviewed counts as never-reviewed
+    (all New) and an unparseable first_seen never promotes into New, the
+    same convention as build_report. Still-open items bucket by age. Empty
+    tiers, buckets and repo groups are omitted. `activity` is filled from
+    `activity_data` (the activity model lands in a later task); a placeholder
+    keeps the model shape stable until then.
+    """
+    end_dt = _parse(generated_at)
+    # An unparseable generated_at is a programming error; degrade the report
+    # clock to a live "now" (datetime.min would overflow once localised to a
+    # negative-offset timezone) — same policy as render_digest_markdown.
+    now = end_dt if end_dt is not None else datetime.now(UTC)
+    start_dt = _parse(coverage_start)
+    if start_dt is None or end_dt is None:
+        days = 1  # defensive: unparseable coverage bounds degrade to 1 day
+    else:
+        days = max(1, (end_dt - start_dt).days)
+
+    last_reviewed = _parse(state.last_reviewed) if state.last_reviewed else None
+    open_pairs = [(mid, r) for mid, r in state.items.items() if r.status == "open"]
+    # Newest first, ties by id ascending, unparseable last: stable two-pass
+    # sort (id ascending first, then recency).
+    open_pairs.sort(key=lambda pair: pair[0])
+    open_pairs.sort(key=lambda pair: _recency_sort_key(pair[1].last_updated))
+
+    new_items: list[dict] = []
+    still_open: list[dict] = []
+    for mid, r in open_pairs:
+        first_seen = _parse(r.first_seen or "")
+        is_new = (
+            first_run
+            or last_reviewed is None
+            or (first_seen is not None and first_seen > last_reviewed)
+        )
+        bucket = "new" if is_new else age_bucket(r.last_updated, now)
+        entry = _item_entry(mid, r, now, bucket)
+        (new_items if is_new else still_open).append(entry)
+
+    buckets = []
+    for key in BUCKETS:
+        entries = [e for e in still_open if e["age_bucket"] == key]
+        if not entries:
+            continue  # empty buckets are omitted
+        buckets.append({"key": key, "label": BUCKET_TITLES[key], "groups": _repo_groups(entries)})
+
+    attention: dict = {"buckets": buckets}
+    new_groups = _repo_groups(new_items)
+    if new_groups:
+        attention = {"new": {"groups": new_groups}, "buckets": buckets}
+
+    open_entries = new_items + still_open
+    kpi = {
+        "new": len(new_items),
+        "still_open": len(still_open),
+        "assigned": sum(1 for e in open_entries if "issue_assigned" in e["kinds"]),
+        "ci_failing": sum(1 for e in open_entries if "ci_failure" in e["kinds"]),
+        "stale_prs": sum(1 for e in open_entries if "stale_pr" in e["kinds"]),
+    }
+
+    return {
+        "schema_version": 1,
+        "generated_at": generated_at,
+        "coverage": {
+            "start": coverage_start,
+            "end": generated_at,
+            "days": days,
+            "first_run": first_run,
+        },
+        "status": {"reviewed": False, "reviewed_at": None},
+        "stale_providers": list(stale_providers),
+        "kpi": kpi,
+        "attention": attention,
+        "activity": (
+            activity_data if activity_data is not None else {"markdown": "", "providers": []}
+        ),
+    }
+
+
 def _fmt_local(ts: str) -> str:
     dt = _parse(ts)
     if dt is None:
@@ -288,9 +511,9 @@ def _fmt_local(ts: str) -> str:
 
 def _entry_line(entry: dict) -> str:
     title = entry.get("title") or entry["id"]
-    url = entry.get("url", "")
-    if url.startswith(("http://", "https://")) and not _URL_UNSAFE.search(url):
-        line = f"- [{title}]({url})"
+    safe_url = _safe_url(entry.get("url", ""))
+    if safe_url:
+        line = f"- [{title}]({safe_url})"
     else:
         line = f"- {title}"
     if entry.get("reopen_count"):

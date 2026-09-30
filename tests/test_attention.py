@@ -573,7 +573,7 @@ def test_new_bucket_sorted_newest_first():
 
 
 def _report_with(entry):
-    return {"new": [entry], "today": [], "week": [], "older": []}
+    return {"new": [entry], "today": [], "week": [], "month": [], "older": []}
 
 
 def test_url_guard_javascript_scheme_no_link():
@@ -690,3 +690,335 @@ def test_humanize_age_edges():
     assert humanize_age("2026-09-29T06:00:00+00:00", now) == "just now"  # future
     # 1 year exactly -> no zero remainder
     assert humanize_age("2025-09-28T06:00:00+00:00", now) == "1 year ago"
+
+
+# --- report model (Task 2: badges, buckets, ages, KPIs) ----------------------
+
+
+def _model_state(items, **extra):
+    return AttentionState.model_validate(state_with(items=items, **extra))
+
+
+def test_badges_for_precedence_and_lp_bug():
+    from gitreport.attention import badges_for
+
+    # Precedence regardless of input order (state stores kinds sorted).
+    assert badges_for(["stale_pr", "ci_failure"], "github") == [("CI", "ci"), ("stale", "stale")]
+    assert badges_for(["comment", "mention", "thread_unresolved"], None) == [
+        ("thread", "thread"),
+        ("mention", "mention"),
+        ("comment", "comment"),
+    ]
+    # Unknown kind -> ("item", "item"), ordered after all known badges.
+    assert badges_for(["ci_failure", "mystery_kind"], "github") == [
+        ("CI", "ci"),
+        ("item", "item"),
+    ]
+    assert badges_for(["mystery_kind"], "github") == [("item", "item")]
+    # Launchpad override: issue_assigned renders the bug badge.
+    assert badges_for(["issue_assigned"], "launchpad") == [("bug", "bug")]
+    assert badges_for(["issue_assigned"], "github") == [("issue", "issue")]
+    # Duplicate kinds dedupe to one badge; no kinds -> no badges.
+    assert badges_for(["mention", "mention"], "github") == [("mention", "mention")]
+    assert badges_for([], "github") == []
+
+
+def test_age_bucket_first_match(monkeypatch):
+    """First match wins: same local calendar date -> today (the date check
+    runs before any duration check); boundaries are inclusive (exactly
+    now-7d -> week, exactly now-30d -> month). TZ pinned to UTC so the
+    calendar-date checks are deterministic (time.tzset() is POSIX-only; see
+    the humanize_age tests)."""
+    from gitreport.attention import age_bucket
+
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    now = datetime.fromisoformat(NOW)  # 2026-09-28T06:00:00+00:00
+    assert age_bucket("2026-09-28T01:00:00+00:00", now) == "today"
+    # 20h old but yesterday's local date: not today — first match continues.
+    assert age_bucket("2026-09-27T10:00:00+00:00", now) == "week"
+    assert age_bucket("2026-09-21T06:00:00+00:00", now) == "week"  # exactly now-7d: inclusive
+    assert age_bucket("2026-09-21T05:59:59+00:00", now) == "month"  # 1s past the boundary
+    assert age_bucket("2026-09-20T06:00:00+00:00", now) == "month"  # 8d: month window
+    assert age_bucket("2026-08-29T06:00:00+00:00", now) == "month"  # exactly now-30d: inclusive
+    assert age_bucket("2026-08-29T05:59:59+00:00", now) == "older"  # 1s past the 30d boundary
+    assert age_bucket("2026-08-28T06:00:00+00:00", now) == "older"  # 31d
+    assert age_bucket("2026-08-01T06:00:00+00:00", now) == "older"
+    # Unparseable / None -> "older" (defensive; sorted last).
+    assert age_bucket(None, now) == "older"
+    assert age_bucket("GARBAGE-TS", now) == "older"
+
+
+def test_report_model_groups_and_buckets():
+    from gitreport.attention import report_model
+
+    state = _model_state(
+        {
+            "gh:1": rec(
+                title="Fix &amp; ship",
+                repo="o/r",
+                kinds=["ci_failure", "stale_pr"],
+                reasons=["3 unresolved comments"],
+                first_seen="2026-09-28T06:00:00+00:00",
+                last_updated=NOW,
+            ),
+            "gh:2": rec(
+                title="B",
+                repo="o/r",
+                kinds=["issue_assigned"],
+                first_seen="2026-09-01T06:00:00+00:00",
+                last_updated="2026-09-01T06:00:00+00:00",
+            ),
+            "lp:1": rec(
+                title="C",
+                repo="proj",
+                kinds=["issue_assigned"],
+                provider="launchpad",
+                url="https://launchpad.net/bugs/1",
+                first_seen="2026-08-01T06:00:00+00:00",
+                last_updated="2026-08-01T06:00:00+00:00",
+            ),
+        },
+        last_reviewed="2026-09-20T06:00:00+00:00",
+    )
+    model = report_model(
+        state,
+        generated_at=NOW,
+        coverage_start="2026-09-27T06:00:00+00:00",
+        first_run=False,
+        stale_providers=[],
+    )
+    assert model["schema_version"] == 1
+    assert model["generated_at"] == NOW
+    assert model["coverage"] == {
+        "start": "2026-09-27T06:00:00+00:00",
+        "end": NOW,
+        "days": 1,
+        "first_run": False,
+    }
+    assert model["status"] == {"reviewed": False, "reviewed_at": None}
+    assert model["stale_providers"] == []
+    # New tier: gh:1 only (first_seen 09-28 > last_reviewed 09-20); gh:2
+    # (09-01) and lp:1 (08-01) are Still open. KPI ANY-matches on kinds.
+    assert model["kpi"] == {
+        "new": 1,
+        "still_open": 2,
+        "assigned": 2,
+        "ci_failing": 1,
+        "stale_prs": 1,
+    }
+    # gh:2's last_updated (09-01) is 27 days before now (09-28): the "month"
+    # bucket per the spec's inclusive boundaries — not "week".
+    assert [b["key"] for b in model["attention"]["buckets"]] == ["month", "older"]
+    buckets = {b["key"]: b for b in model["attention"]["buckets"]}
+    assert buckets["month"]["label"] == "Last 30 days"
+    assert buckets["older"]["label"] == "Older"
+    assert [i["id"] for g in buckets["month"]["groups"] for i in g["items"]] == ["gh:2"]
+    # New tier: one repo group, newest-first items, badges in precedence order.
+    new_groups = model["attention"]["new"]["groups"]
+    assert [g["repo"] for g in new_groups] == ["o/r"]
+    gh1 = new_groups[0]["items"][0]
+    assert gh1["id"] == "gh:1"
+    assert gh1["age_bucket"] == "new"
+    assert gh1["type_badges"] == [("CI", "ci"), ("stale", "stale")]
+    assert set(gh1) == {
+        "id",
+        "repo",
+        "title",
+        "url",
+        "reasons",
+        "kinds",
+        "type_badges",
+        "age",
+        "age_bucket",
+        "last_updated",
+        "reopened",
+    }
+    # Escaping contract: the model carries plain text (unescape_user).
+    assert gh1["title"] == "Fix & ship"
+    assert gh1["reasons"] == ["3 unresolved comments"]
+    assert gh1["reopened"] is False
+    gh2 = buckets["month"]["groups"][0]["items"][0]
+    assert gh2["type_badges"] == [("issue", "issue")]
+    assert gh2["age"] == "3 weeks ago"
+    assert gh2["age_bucket"] == "month"
+    lp1 = buckets["older"]["groups"][0]["items"][0]
+    assert lp1["type_badges"] == [("bug", "bug")]  # LP provider override
+    assert lp1["age"] == "1 month ago"
+    assert lp1["age_bucket"] == "older"
+    # No activity data yet (Task 3): placeholder.
+    assert model["activity"] == {"markdown": "", "providers": []}
+
+
+def test_report_model_sorting_group_and_item_order():
+    """Items: last_updated desc, tie id asc, unparseable last. Groups: newest
+    item desc, tie repo name asc. All items land in the "older" bucket so the
+    unparseable one shares a group with parseable ones."""
+    from gitreport.attention import report_model
+
+    state = _model_state(
+        {
+            # Insertion order is deliberately NOT the expected output order.
+            "gh:b": rec(
+                first_seen="2026-08-01T00:00:00+00:00",
+                last_updated="2026-08-02T00:00:00+00:00",
+            ),
+            "gh:bad": rec(
+                first_seen="2026-08-01T00:00:00+00:00",
+                last_updated="GARBAGE-TS",
+            ),
+            "gh:c": rec(
+                first_seen="2026-08-01T00:00:00+00:00",
+                last_updated="2026-08-05T00:00:00+00:00",
+            ),
+            "gh:a": rec(
+                first_seen="2026-08-01T00:00:00+00:00",
+                last_updated="2026-08-02T00:00:00+00:00",
+            ),
+            "lp:z": rec(
+                repo="proj",
+                provider="launchpad",
+                first_seen="2026-08-01T00:00:00+00:00",
+                last_updated="2026-08-04T00:00:00+00:00",
+            ),
+            "lp:w": rec(
+                repo="aaa",
+                provider="launchpad",
+                first_seen="2026-08-01T00:00:00+00:00",
+                last_updated="2026-08-05T00:00:00+00:00",
+            ),
+        },
+        last_reviewed="2026-09-20T06:00:00+00:00",
+    )
+    model = report_model(
+        state,
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+    )
+    assert [b["key"] for b in model["attention"]["buckets"]] == ["older"]
+    groups = model["attention"]["buckets"][0]["groups"]
+    # Groups by newest item desc; aaa/o/r tie on newest (08-05) -> repo asc.
+    assert [g["repo"] for g in groups] == ["aaa", "o/r", "proj"]
+    # Items newest-first; gh:a/gh:b tie on last_updated -> id asc; the
+    # unparseable gh:bad sorts last despite being first in the state dict.
+    assert [i["id"] for i in groups[1]["items"]] == ["gh:c", "gh:a", "gh:b", "gh:bad"]
+    assert groups[1]["items"][-1]["age"] == "unknown age"
+    assert groups[1]["items"][-1]["age_bucket"] == "older"
+
+
+def test_report_model_unparseable_last_updated():
+    from gitreport.attention import report_model
+
+    state = _model_state(
+        {
+            "gh:bad": rec(
+                title="Bad",
+                first_seen="2026-08-01T06:00:00+00:00",
+                last_updated="GARBAGE-TS",
+            ),
+            "gh:ok": rec(
+                title="Ok",
+                first_seen="2026-08-01T06:00:00+00:00",
+                last_updated="2026-08-01T06:00:00+00:00",
+            ),
+        },
+        last_reviewed="2026-09-20T06:00:00+00:00",
+    )
+    model = report_model(
+        state,
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+    )
+    older = [b for b in model["attention"]["buckets"] if b["key"] == "older"]
+    assert len(older) == 1
+    items = [i for g in older[0]["groups"] for i in g["items"]]
+    assert [i["id"] for i in items] == ["gh:ok", "gh:bad"]  # unparseable last
+    assert items[-1]["age"] == "unknown age"
+    assert items[-1]["age_bucket"] == "older"
+    # Unparseable metadata must not drop the item from the KPI counts.
+    assert model["kpi"]["still_open"] == 2
+
+
+def test_report_model_first_run():
+    from gitreport.attention import report_model
+
+    state = _model_state(
+        {
+            "gh:1": rec(
+                first_seen="2026-08-01T06:00:00+00:00",
+                last_updated="2026-08-01T06:00:00+00:00",
+            )
+        }
+    )
+    model = report_model(
+        state,
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=True,
+        stale_providers=[],
+    )
+    assert model["coverage"]["first_run"] is True
+    # first_run: every open item is New regardless of age.
+    new_groups = model["attention"]["new"]["groups"]
+    assert [i["id"] for g in new_groups for i in g["items"]] == ["gh:1"]
+    assert new_groups[0]["items"][0]["age_bucket"] == "new"
+    # No still-open items: every bucket is omitted.
+    assert model["attention"]["buckets"] == []
+    assert model["kpi"]["new"] == 1
+    assert model["kpi"]["still_open"] == 0
+    # Same convention without the flag: an unset last_reviewed counts as
+    # never-reviewed, so the item is still New.
+    model2 = report_model(
+        state,
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+    )
+    assert [i["id"] for g in model2["attention"]["new"]["groups"] for i in g["items"]] == ["gh:1"]
+
+
+def test_report_model_url_guarded_and_reopened_flag():
+    """The model carries only the scheme-safe URL (unsafe -> ""), and the
+    reopened flag mirrors reopen_count > 0."""
+    from gitreport.attention import report_model
+
+    state = _model_state(
+        {
+            "gh:1": rec(
+                title="Evil",
+                url="javascript:alert(1)",
+                reopen_count=2,
+                first_seen="2026-09-28T06:00:00+00:00",
+            ),
+            "gh:2": rec(
+                title="Odd",
+                repo="o/r2",
+                url="https://example.com/a(b)",
+                first_seen="2026-09-28T06:00:00+00:00",
+            ),
+            "gh:3": rec(
+                title="Safe",
+                repo="o/r3",
+                url="https://example.com/1",
+                first_seen="2026-09-28T06:00:00+00:00",
+            ),
+        },
+        last_reviewed="2026-09-20T06:00:00+00:00",
+    )
+    model = report_model(
+        state,
+        generated_at=NOW,
+        coverage_start=NOW,
+        first_run=False,
+        stale_providers=[],
+    )
+    items = {i["id"]: i for g in model["attention"]["new"]["groups"] for i in g["items"]}
+    assert items["gh:1"]["url"] == ""
+    assert items["gh:1"]["reopened"] is True
+    assert items["gh:2"]["url"] == ""  # parens break [title](url): no link
+    assert items["gh:3"]["url"] == "https://example.com/1"
