@@ -288,8 +288,9 @@ badge marks the Launchpad provider taxonomy deliberately.
   (multiple targets are processed independently). The banner text is
   rendered from `model.status` — display format ("Reviewed Mon 28 Sep
   09:14", local time) is renderer-side. An **unusable** `.json` (JSON
-  decode error, `schema_version` mismatch, missing/extra required keys, or
-  a `generated_at` differing from the `.md` front matter) → warn and
+  decode error, `schema_version` mismatch, missing required keys — extra
+  top-level keys are tolerated for forward compatibility — or a
+  `generated_at` differing from the `.md` front matter) → warn and
   restamp the `.md` only. A **missing** `.json` (pre-upgrade digests) →
   legacy fallback: restamp the `.md` and re-convert via `render_html`; the
   fallback's HTML shows the legacy single-column look (the `markdown`
@@ -299,10 +300,11 @@ badge marks the Launchpad provider taxonomy deliberately.
 
 ## Error handling
 
-- An unusable `.json` during `read` (corrupt, schema mismatch, key
-  mismatch, `generated_at` divergence — see *CLI & artifacts*): warn,
-  restamp `.md` only — never crash, never mutate state beyond the cursor.
-  A missing `.json` uses the legacy fallback path.
+- An unusable `.json` during `read` (corrupt, schema mismatch, missing
+  required keys — extra top-level keys are tolerated for forward
+  compatibility — or `generated_at` divergence — see *CLI & artifacts*):
+  warn, restamp `.md` only — never crash, never mutate state beyond the
+  cursor. A missing `.json` uses the legacy fallback path.
 - `report_model` building with zero items/failed providers renders the same
   empty-state dashboard ("Nothing needs your attention.") with the stale
   warning list — same semantics as the Markdown renderer today.
@@ -337,9 +339,11 @@ badge marks the Launchpad provider taxonomy deliberately.
   groups omitted.
 - Artifacts: `.json` always written (incl. when html is disabled) with no
   symlink; atomic-write behaviour; `read` with multiple targets; `read`
-  with html disabled (no `.html` created/updated); each unusable-`.json`
-  condition (decode error, schema mismatch, missing/extra keys,
-  `generated_at` divergence) → warn + `.md`-only restamp; pre-upgrade
+   with html disabled (no `.html` created/updated); each unusable-`.json`
+   condition (decode error, schema mismatch, missing keys,
+   `generated_at` divergence) → warn + `.md`-only restamp, while extra
+   top-level keys are tolerated (they take the normal reviewed path);
+   pre-upgrade
   missing-`.json` fallback renders the legacy single-column HTML; config
   validation (bad `digest_formats` value; `digest_output`/`state_path`
   collision).

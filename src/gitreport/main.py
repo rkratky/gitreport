@@ -598,15 +598,19 @@ def _load_digest_model(json_path: Path, md_generated_at: str) -> dict | None:
     """Load and validate the sibling .json snapshot of a digest .md.
 
     Returns the model dict when usable for the read re-render, else None
-    (with a stderr warning) when unusable: a JSON decode error, a non-object
-    document, schema_version != 1, any missing required top-level key, or a
-    generated_at differing from the .md front matter.
+    (with a stderr warning) when unusable: an unreadable file (missing
+    permissions, a directory, invalid UTF-8 — BUG-01), a JSON decode error,
+    a non-object document, schema_version != 1, any missing required
+    top-level key, or a generated_at differing from the .md front matter.
+    Extra top-level keys are tolerated (forward compatibility).
     """
     try:
         model = json.loads(json_path.read_text())
-    except json.JSONDecodeError as e:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        # The cursor has already advanced by the time this runs, so a crash
+        # here would permanently skip every later target: degrade instead.
         click.echo(
-            f"Warning: {json_path} is corrupt ({e}); restamping the Markdown only.",
+            f"Warning: {json_path} is corrupt or unreadable ({e}); restamping the Markdown only.",
             err=True,
         )
         return None
@@ -640,9 +644,13 @@ def _advance_digest_artifacts(path: Path, stamped_md: str, reviewed_at: str, htm
       fabricated;
     - unusable .json: warned about (and ignored) by _load_digest_model — the
       .md-only restamp already happened;
-    - usable: the model's status advances to reviewed (atomic rewrite) and
-      the .html re-renders from the model via render_dashboard_html when
-      html is enabled.
+    - usable: the model's status advances to reviewed and — BUG-02 — the
+      .html is rendered from that model BEFORE either artifact is written,
+      so a render crash leaves the .json still unreviewed and the .html
+      untouched (treated like an unusable .json: warn + .md-only); only a
+      successful render is followed by the atomic .json rewrite and .html
+      write (the .html re-renders via render_dashboard_html when html is
+      enabled).
     """
     stem = path.with_suffix("")
     json_path = _stem_file(stem, "json")
@@ -655,9 +663,22 @@ def _advance_digest_artifacts(path: Path, stamped_md: str, reviewed_at: str, htm
     if model is None:
         return
     model["status"] = {"reviewed": True, "reviewed_at": reviewed_at}
-    atomic_write_text(json_path, json.dumps(model, indent=2))
+    html_text = None
     if html_enabled:
-        atomic_write_text(_stem_file(stem, "html"), render_dashboard_html(model))
+        try:
+            html_text = render_dashboard_html(model)
+        except Exception as e:  # noqa: BLE001
+            # Writing the reviewed .json first would strand it next to a
+            # stale .html; render-first keeps the artifacts consistent.
+            click.echo(
+                f"Warning: could not re-render {_stem_file(stem, 'html')} ({e}); "
+                "restamping the Markdown only.",
+                err=True,
+            )
+            return
+    atomic_write_text(json_path, json.dumps(model, indent=2))
+    if html_text is not None:
+        atomic_write_text(_stem_file(stem, "html"), html_text)
 
 
 def _refresh_symlinks(dated_stem: Path, latest_stem: Path, formats: list[str]) -> None:

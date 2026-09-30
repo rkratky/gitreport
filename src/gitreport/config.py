@@ -44,19 +44,38 @@ class AttentionConfig(BaseModel):
             raise ValueError(
                 f"digest_formats only supports html and md (got: {', '.join(unknown)})"
             )
-        # S19: a digest artifact path resolving onto the state store would let
-        # a digest run overwrite it — reject the collision. Paths are compared
-        # on expanduser'd copies (load_config anchors still-relative paths
-        # afterwards; equality is anchor-independent when both sides share a
-        # base, and a ~-expanded path can never equal a bare relative one).
-        state = self.state_path.expanduser()
-        stem = self.digest_output.expanduser()
-        for ext in ("json", "md", "html"):
-            artifact = stem.with_name(stem.name + "." + ext)
-            if artifact == state:
+        # S19/CFG-01: a digest artifact path resolving onto the state store
+        # would let a digest run overwrite it — reject the collision. Both
+        # sides are compared fully resolved (expanduser + resolve), so
+        # symlinks and `..` segments cannot dodge the check; the YYYY-MM-DD
+        # token is compared both raw and substituted (a literal dated
+        # state_path would otherwise slip past the raw form); digest_latest
+        # is checked too, since its artifacts are refreshed on every digest
+        # run. (The validator runs before load_config anchors still-relative
+        # paths, so relative configs resolve against the CWD on both sides —
+        # equality is anchor-independent when both sides share a base, and a
+        # ~-expanded absolute path can never equal a bare relative one.)
+        state = self.state_path.expanduser().resolve(strict=False)
+
+        def _collision_ext(stem: Path) -> str | None:
+            candidates = [stem]
+            if "YYYY-MM-DD" in stem.name:
+                candidates.append(stem.with_name(stem.name.replace("YYYY-MM-DD", "1970-01-01")))
+            for candidate in candidates:
+                for ext in ("json", "md", "html"):
+                    artifact = candidate.with_name(candidate.name + "." + ext)
+                    if artifact.expanduser().resolve(strict=False) == state:
+                        return ext
+            return None
+
+        for label, stem in (
+            ("digest_output", self.digest_output.expanduser()),
+            ("digest_latest", self.digest_latest.expanduser()),
+        ):
+            ext = _collision_ext(stem)
+            if ext is not None:
                 raise ValueError(
-                    "digest/state path collision: digest_output's "
-                    f".{ext} artifact ({artifact}) equals state_path"
+                    f"digest/state path collision: {label}'s .{ext} artifact resolves to state_path"
                 )
         return self
 

@@ -1305,10 +1305,11 @@ def test_read_flips_json_status_and_rerenders_dashboard(mock_load_config, tmp_pa
     html_text = html_path.read_text()
     assert "Reviewed" in html_text
     assert "NOT YET REVIEWED" not in html_text
-    # Banner-only byte diff: every line outside the status pill is unchanged.
-    before_body = [line for line in before.splitlines() if "gr-status" not in line]
-    after_body = [line for line in html_text.splitlines() if "gr-status" not in line]
-    assert before_body == after_body
+    # TEST-02 banner-only byte diff: substitute the status pill in both
+    # versions and assert full-string equality — no line-dropping, so any
+    # change outside the pill fails the test.
+    pill = re.compile(r'<span class="gr-status[^"]*">[^<]*</span>')
+    assert pill.sub("PILL", before) == pill.sub("PILL", html_text)
 
 
 def _write_digest_files(directory, day_stem, generated_at):
@@ -1426,11 +1427,49 @@ def test_read_missing_json_uses_legacy_fallback(mock_load_config, tmp_path):
     assert not (tmp / "digests" / "2026-09-28.json").exists()
 
 
+@pytest.mark.parametrize(
+    "make_json_text, usable, fragment",
+    [
+        pytest.param(
+            lambda _base: "{corrupt json", False, "corrupt or unreadable", id="decode-error"
+        ),
+        pytest.param(lambda _base: json.dumps([1, 2]), False, "not a JSON object", id="non-object"),
+        pytest.param(
+            lambda base: json.dumps({**base, "schema_version": 2}),
+            False,
+            "schema_version",
+            id="schema-version-2",
+        ),
+        pytest.param(
+            lambda base: json.dumps({k: v for k, v in base.items() if k != "kpi"}),
+            False,
+            "missing key",
+            id="missing-key",
+        ),
+        pytest.param(
+            lambda base: json.dumps({**base, "generated_at": "2020-01-01T00:00:00+00:00"}),
+            False,
+            "generated_at does not match",
+            id="generated-at-diverged",
+        ),
+        pytest.param(
+            lambda base: json.dumps({**base, "future_field": {"new": [1]}}),
+            True,
+            None,
+            id="extra-key-tolerated",
+        ),
+    ],
+)
 @patch("gitreport.main.load_config")
 @patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
-def test_read_corrupt_json_warns_and_restamps_md_only(mock_load_config, tmp_path_factory):
-    """An unusable .json (schema_version != 1) must not crash read: warn, keep
-    the .json and .html untouched, restamp the .md only."""
+def test_read_json_usability_matrix(
+    mock_load_config, tmp_path_factory, make_json_text, usable, fragment
+):
+    """TEST-01: every unusable-.json condition (decode error, non-object,
+    schema_version mismatch, missing key, generated_at divergence) warns and
+    restamps the .md only, leaving the .json and .html byte-identical —
+    while an extra top-level key is tolerated (forward compat, mirrors
+    state.py extra="allow") and takes the normal reviewed path."""
     tmp = tmp_path_factory.mktemp("read-corrupt")
     mock_load_config.return_value = _config_with(
         state_path=tmp / "state.json",
@@ -1440,16 +1479,126 @@ def test_read_corrupt_json_warns_and_restamps_md_only(mock_load_config, tmp_path
 
     runner = CliRunner()
     assert runner.invoke(cli, ["digest"]).exit_code == 0
-    corrupt = {"schema_version": 99}
     json_path = tmp / "digests" / "2026-09-28.json"
-    json_path.write_text(json.dumps(corrupt))
-    pre_html = (tmp / "digests" / "2026-09-28.html").read_text()
+    base = json.loads(json_path.read_text())
+    json_path.write_text(make_json_text(base))
+    pre_json = json_path.read_bytes()
+    html_path = tmp / "digests" / "2026-09-28.html"
+    pre_html = html_path.read_bytes()
+
+    result = runner.invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    md_text = (tmp / "digests" / "2026-09-28.md").read_text()
+    assert "Status: Reviewed" in md_text  # never gated on the sibling .json
+    if not usable:
+        assert "Warning" in result.output
+        assert fragment in result.output
+        assert json_path.read_bytes() == pre_json  # untouched, still unreviewed
+        assert html_path.read_bytes() == pre_html
+        return
+    assert "Warning" not in result.output
+    model = json.loads(json_path.read_text())
+    assert model["schema_version"] == 1
+    assert model["status"]["reviewed"] is True
+    assert model["status"]["reviewed_at"]
+    assert "NOT YET REVIEWED" not in html_path.read_text()
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_read_invalid_utf8_json_warns_and_restamps_md_only(mock_load_config, tmp_path_factory):
+    """BUG-01: invalid UTF-8 in the .json raises UnicodeDecodeError from
+    read_text (not a JSONDecodeError) — read must degrade the same way:
+    warn, restamp the .md only, .json/.html byte-identical."""
+    tmp = tmp_path_factory.mktemp("read-utf8")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["digest"]).exit_code == 0
+    json_path = tmp / "digests" / "2026-09-28.json"
+    json_path.write_bytes(b'{"schema_version": \xff\xfe}')
+    pre_json = json_path.read_bytes()
+    html_path = tmp / "digests" / "2026-09-28.html"
+    pre_html = html_path.read_bytes()
 
     result = runner.invoke(cli, ["read"])
 
     assert result.exit_code == 0, result.output
     assert "Warning" in result.output
-    assert "schema_version" in result.output
+    assert "corrupt or unreadable" in result.output
     assert "Status: Reviewed" in (tmp / "digests" / "2026-09-28.md").read_text()
-    assert json.loads(json_path.read_text()) == corrupt
-    assert (tmp / "digests" / "2026-09-28.html").read_text() == pre_html
+    assert json_path.read_bytes() == pre_json
+    assert html_path.read_bytes() == pre_html
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_read_directory_json_warns_and_restamps_md_only(mock_load_config, tmp_path_factory):
+    """BUG-01: a .json path that is actually a directory raises
+    IsADirectoryError — again an OSError, not a JSONDecodeError; the cursor
+    has already advanced, so a crash here would permanently skip later
+    targets. Read must degrade: warn, .md-only restamp."""
+    tmp = tmp_path_factory.mktemp("read-dirjson")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["digest"]).exit_code == 0
+    json_path = tmp / "digests" / "2026-09-28.json"
+    json_path.unlink()
+    json_path.mkdir()
+    html_path = tmp / "digests" / "2026-09-28.html"
+    pre_html = html_path.read_bytes()
+
+    result = runner.invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.output
+    assert "corrupt or unreadable" in result.output
+    assert "Status: Reviewed" in (tmp / "digests" / "2026-09-28.md").read_text()
+    assert json_path.is_dir()  # nothing was written over the directory
+    assert html_path.read_bytes() == pre_html
+
+
+@patch("gitreport.main.load_config")
+@patch("gitreport.main.PROVIDER_MAP", {"mock": NoopProvider})
+def test_read_render_failure_leaves_artifacts_consistent(mock_load_config, tmp_path_factory):
+    """BUG-02: a render crash after the .json loaded (here `attention`
+    poisoned to a string) must not leave a reviewed .json next to a stale
+    .html. The render runs FIRST; its failure is treated like an unusable
+    .json: warn, keep both artifacts byte-identical (.json still
+    unreviewed), .md-only restamp."""
+    tmp = tmp_path_factory.mktemp("read-render-boom")
+    mock_load_config.return_value = _config_with(
+        state_path=tmp / "state.json",
+        stem=tmp / "digests" / "2026-09-28",
+        latest=tmp / "digests" / "latest",
+    )
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["digest"]).exit_code == 0
+    json_path = tmp / "digests" / "2026-09-28.json"
+    poisoned = json.loads(json_path.read_text())
+    poisoned["attention"] = "poisoned-not-a-dict"
+    json_path.write_text(json.dumps(poisoned))
+    pre_json = json_path.read_bytes()
+    html_path = tmp / "digests" / "2026-09-28.html"
+    pre_html = html_path.read_bytes()
+
+    result = runner.invoke(cli, ["read"])
+
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.output
+    assert "re-render" in result.output
+    assert "Status: Reviewed" in (tmp / "digests" / "2026-09-28.md").read_text()
+    assert json_path.read_bytes() == pre_json  # never written: still unreviewed
+    assert json.loads(json_path.read_text()) == poisoned
+    assert html_path.read_bytes() == pre_html

@@ -191,3 +191,41 @@ def test_digest_output_state_path_no_collision(tmp_path: Path):
     config = load_config(config_file)
 
     assert config.attention.state_path == tmp_path / "state" / "state.json"
+
+
+def test_digest_output_stem_state_collision_rejected(tmp_path: Path):
+    """CFG-01: a digest_output stem named `state` puts every digest artifact
+    (.json/.md/.html) on the state store — rejected (hardened resolved-path
+    check still catches the plain case)."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": "digests/state.json",
+            "digest_output": "digests/state",
+            "digest_latest": "digests/latest",
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    with pytest.raises(ValueError, match="collision"):
+        load_config(config_file)
+
+
+def test_digest_latest_stem_state_collision_rejected(tmp_path: Path):
+    """CFG-01: digest_latest's artifacts are refreshed on every digest run —
+    a `latest` stem colliding with state_path is rejected (the original check
+    only compared digest_output)."""
+    config_content = {
+        "providers": {"github": {"username": "u", "token": "t"}},
+        "attention": {
+            "state_path": "digests/state.json",
+            "digest_output": "digests/YYYY-MM-DD",
+            "digest_latest": "digests/state",
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config_content))
+
+    with pytest.raises(ValueError, match="collision"):
+        load_config(config_file)
