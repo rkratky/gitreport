@@ -1,3 +1,4 @@
+import time
 from datetime import datetime
 
 import gitreport.attention as attention
@@ -618,13 +619,27 @@ def test_titles_not_re_escaped():
     assert "&amp;amp;" not in out
 
 
+def test_humanize_age_today_yesterday_pinned_utc(monkeypatch):
+    """Today/yesterday are local-calendar-date checks, so the local TZ is
+    pinned to UTC (POSIX TZ env var + tzset) to make the result deterministic
+    on any machine. Note: time.tzset() is POSIX-only (Linux/macOS); the test
+    suite targets POSIX systems."""
+    from gitreport.attention import humanize_age
+
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    now = datetime.fromisoformat(NOW)  # 2026-09-28T06:00:00+00:00
+    assert humanize_age("2026-09-28T05:00:00+00:00", now) == "today"
+    assert humanize_age("2026-09-27T10:00:00+00:00", now) == "yesterday"
+
+
 def test_humanize_age_units():
+    """Spec examples. Whole-day diffs at fixed UTC instants, so these are
+    TZ-independent."""
     from gitreport.attention import humanize_age
 
     now = datetime.fromisoformat(NOW)  # 2026-09-28T06:00:00+00:00
     cases = {
-        "2026-09-28T05:00:00+00:00": "today",
-        "2026-09-27T10:00:00+00:00": "yesterday",
         "2026-09-25T06:00:00+00:00": "3 days ago",
         "2026-09-14T06:00:00+00:00": "2 weeks ago",
         "2026-08-01T06:00:00+00:00": "1 month ago",
@@ -633,6 +648,37 @@ def test_humanize_age_units():
     }
     for ts, expected in cases.items():
         assert humanize_age(ts, now) == expected, ts
+
+
+def test_humanize_age_unit_boundaries():
+    """BUG-01/BUG-02: the largest unit whose floor is >= 1 wins; exact
+    multiples land on the larger unit. Whole-day diffs at fixed UTC instants,
+    so TZ-independent."""
+    from gitreport.attention import humanize_age
+
+    now = datetime.fromisoformat(NOW)  # 2026-09-28T06:00:00+00:00
+    cases = {
+        "2026-09-21T06:00:00+00:00": "1 week ago",  # 7d: not "7 days ago"
+        "2026-09-18T06:00:00+00:00": "1 week ago",  # 10d: floor(10/7)
+        "2026-09-07T06:00:00+00:00": "3 weeks ago",  # 21d: not "21 days ago"
+        "2026-08-29T06:00:00+00:00": "4 weeks ago",  # 30d < 30.44: not "0 months ago"
+        "2026-08-28T06:00:00+00:00": "1 month ago",  # 31d: floor(31/30.44)
+        "2025-09-29T06:00:00+00:00": "11 months ago",  # 364d: floor(364/30.44)
+        "2024-09-29T06:00:00+00:00": "1 year, 11 months ago",  # 729d
+        "2024-09-28T06:00:00+00:00": "2 years ago",  # 730d: zero remainder dropped
+    }
+    for ts, expected in cases.items():
+        assert humanize_age(ts, now) == expected, ts
+
+
+def test_humanize_age_naive_now_treated_as_utc():
+    """BUG-03: a naive `now` is normalised to UTC instead of raising
+    TypeError on the aware/naive comparison."""
+    from gitreport.attention import humanize_age
+
+    now = datetime.fromisoformat("2026-09-28T06:00:00")  # naive
+    assert humanize_age("2026-09-21T06:00:00+00:00", now) == "1 week ago"
+    assert humanize_age(None, now) == "unknown age"
 
 
 def test_humanize_age_edges():

@@ -24,8 +24,11 @@ _EPOCH = datetime.min.replace(tzinfo=UTC)
 
 def humanize_age(ts: str | None, now: datetime) -> str:
     """Humanized age as of `now`: today/yesterday (local calendar dates),
-    then largest single unit below one year (day/week/month), then
-    years + remainder months. Unknown/future handled per spec."""
+    then the largest unit whose floor is >= 1 (day/week/month below a year),
+    then years + remainder months (zero remainder dropped). Unknown/future
+    handled per spec."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)  # naive `now` is treated as UTC
     dt = _parse(ts)
     if dt is None:
         return "unknown age"
@@ -38,10 +41,10 @@ def humanize_age(ts: str | None, now: datetime) -> str:
     if day_delta == 1:
         return "yesterday"
     days = (local_now - local_dt).total_seconds() / 86400
-    if days < 14:
+    if days < 7:
         n = int(days)
         unit = "day"
-    elif days < 21:
+    elif days < 30.44:
         n = int(days // 7)
         unit = "week"
     elif days < 365:
